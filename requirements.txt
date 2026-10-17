@@ -1,0 +1,5 @@
+numpy
+opencv-contrib-python-headless
+matplotlib
+pydantic            # needed to import the STEPWISE depth reader
+# open3d            # only for the early mesh scripts (fuse_scan.py, tsdf_fuse.py, refined_fuse.py)

@@ -1,0 +1,32 @@
+# environments and caches
+.venv/
+__pycache__/
+.DS_Store
+
+# recordings and derived data: large, and they show people and rooms
+/iphone_saved/
+/game_*/
+/dataset/
+/review*/
+/*_contact_sheet.png
+/game4_*.png
+*.ply
+
+# private: the viewer's self-signed HTTPS key (regenerated automatically on start)
+/certs/
+
+# someone else's repo: fetched by scripts/setup.sh
+/third_party/STEPWISE/
+
+# generated at runtime (copies worth keeping are in docs/)
+/checkerboard.png
+/tower_check.png
+/overlay_labels_test*.png
+/orientation_*.png
+/crops_montage_*.png
+
+# Xcode
+xcuserdata/
+DerivedData/
+build/
+*.xcuserstate
