@@ -30,3 +30,9 @@ xcuserdata/
 DerivedData/
 build/
 *.xcuserstate
+
+# setup-specific / review images
+/marker_map.json
+/cluster_montage.png
+/l1_check.png
+/top_check.png

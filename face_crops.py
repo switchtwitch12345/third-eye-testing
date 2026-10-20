@@ -44,6 +44,31 @@ def face_geometry(layer, slot, sign):
 
 DST = np.float32([[0, 0], [OUT_W - 1, 0], [OUT_W - 1, OUT_H - 1], [0, OUT_H - 1]])
 
+# LONG SIDE faces (75 x 15 mm).  Only the two OUTER blocks of a layer show one on the tower's surface (the middle
+# block is covered by its neighbours).  A layer's block ENDS sit on one pair of tower faces and its long sides on the
+# other pair, so a phone that sees a layer's ends edge-on usually sees its outer blocks' sides squarely.
+SIDE_W, SIDE_H = 200, 40
+DST_SIDE = np.float32([[0, 0], [SIDE_W - 1, 0], [SIDE_W - 1, SIDE_H - 1], [0, SIDE_H - 1]])
+
+
+def side_geometry(layer, slot, sign):
+    """Long side face of an outer block.  slot 0 faces the negative side, slot 2 the positive side.
+    Returns (corners, centre, outward normal) like face_geometry, or None for the middle slot."""
+    if slot not in (0, 2):
+        return None
+    z = HEIGHT * (layer + 0.5)
+    side = -1.0 if slot == 0 else 1.0
+    if sign != side:
+        return None
+    if layer % 2 == 0:                       # runs along x: slots across y, sides at y = +-HALF
+        c, n = np.array([0.0, side * HALF, z]), np.array([0.0, side, 0.0])
+    else:                                    # runs along y: slots across x, sides at x = +-HALF
+        c, n = np.array([side * HALF, 0.0, z]), np.array([side, 0.0, 0.0])
+    up = np.array([0.0, 0.0, 1.0])
+    r = np.cross(-n, up)
+    w, h = 75.0 * (1 + 2 * MARGIN) / 2, HEIGHT * (1 + 2 * MARGIN) / 2
+    return np.array([c - r * w + up * h, c + r * w + up * h, c + r * w - up * h, c - r * w - up * h]), c, n
+
 
 def crops_for_frame(img, K, R, t, layers=MAX_LAYERS):
     """-> list of (layer, slot, sign, cos, crop_bgr) for faces the camera sees properly."""
@@ -66,6 +91,33 @@ def crops_for_frame(img, K, R, t, layers=MAX_LAYERS):
                     continue
                 M = cv2.getPerspectiveTransform(uv, DST)
                 out.append((layer, slot, sign, cos, cv2.warpPerspective(img, M, (OUT_W, OUT_H), flags=cv2.INTER_AREA)))
+    return out
+
+
+def side_crops_for_frame(img, K, R, t, layers=MAX_LAYERS):
+    """-> list of (layer, slot, sign, cos, crop_bgr) for outer blocks' long side faces seen well enough."""
+    h, w = img.shape[:2]
+    cam = -R.T @ t
+    out = []
+    for layer in range(layers):
+        for slot in (0, 2):
+            sign = -1 if slot == 0 else 1
+            g = side_geometry(layer, slot, sign)
+            if g is None:
+                continue
+            corners, c, n = g
+            to_cam = cam - c
+            cos = float(n @ to_cam) / (np.linalg.norm(to_cam) + 1e-9)
+            if cos < MIN_COS:
+                continue
+            uvw = (corners @ R.T + t) @ K.T
+            if (uvw[:, 2] <= 0).any():
+                continue
+            uv = (uvw[:, :2] / uvw[:, 2:3]).astype(np.float32)
+            if uv[:, 0].min() < 0 or uv[:, 1].min() < 0 or uv[:, 0].max() >= w or uv[:, 1].max() >= h:
+                continue
+            M = cv2.getPerspectiveTransform(uv, DST_SIDE)
+            out.append((layer, slot, sign, cos, cv2.warpPerspective(img, M, (SIDE_W, SIDE_H), flags=cv2.INTER_AREA)))
     return out
 
 
@@ -136,6 +188,14 @@ class DatasetWriter:
             cv2.imwrite(path, crop, [cv2.IMWRITE_JPEG_QUALITY, self.q])
             self.index.write(json.dumps({"cam": cam, "ts_ms": int(ts), "t_sec": round((int(ts) - self.t0) / 1000, 2),
                                          "layer": layer, "slot": slot, "sign": sign, "cos": round(cos, 3),
+                                         "pose_src": src, "reproj": round(err, 2), "file": fn}) + "\n")
+            self.counts["crops"] += 1
+        for layer, slot, sign, cos, crop in side_crops_for_frame(img, K, R, t):
+            fn = f"{cam}/{ts}_L{layer}_S{slot}_{'p' if sign > 0 else 'm'}_side.jpg"
+            path = os.path.join(self.out, fn)
+            cv2.imwrite(path, crop, [cv2.IMWRITE_JPEG_QUALITY, self.q])
+            self.index.write(json.dumps({"cam": cam, "ts_ms": int(ts), "t_sec": round((int(ts) - self.t0) / 1000, 2),
+                                         "layer": layer, "slot": slot, "sign": sign, "cos": round(cos, 3), "kind": "side",
                                          "pose_src": src, "reproj": round(err, 2), "file": fn}) + "\n")
             self.counts["crops"] += 1
         self.counts["frames"] += 1

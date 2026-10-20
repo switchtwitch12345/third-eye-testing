@@ -18,13 +18,58 @@ import matplotlib.pyplot as plt
 
 SAVE_DIR = os.environ.get("LIDAR_SAVE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "iphone_saved"))
 MARKER_MM = 40.0
-HALF = 91.0  # half of the measured ~182 mm marker spacing
+HALF = float(os.environ.get("MARKER_HALF", 80.0))  # half the marker spacing (mm): 80 = current mat (~160 mm); 91 = games 03/04
 LAYOUTS = {   # IDs run around the square; A = counter-clockwise from above, B = clockwise
     # Your bottom layer runs along the markers' y direction, so the tower frame is the marker
     # square turned -90 degrees: that way layer 0 runs along x, as the tower geometry assumes.
     "A": {0: (-HALF, HALF), 1: (-HALF, -HALF), 2: (HALF, -HALF), 3: (HALF, HALF)},
     "B": {0: (-HALF, -HALF), 1: (-HALF, HALF), 2: (HALF, HALF), 3: (HALF, -HALF)},
 }
+MARKER_YAW = {}      # id -> degrees; filled from marker_map.json (measured orientation of each marker)
+TOWER_ROT = 0        # the tower frame is turned by -90 degrees this many times (so layer 0 runs along x)
+_BASE = None         # (positions, yaws) of the markers before any such turn
+_MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "marker_map.json")
+
+
+def _apply_rotation(k):
+    """Re-express the marker layout in a tower frame turned by -90 degrees k times. Edits in place so every
+    module that already holds LAYOUTS["A"] sees the change."""
+    global TOWER_ROT
+    pos, yaw = dict(_BASE[0]), dict(_BASE[1])
+    for _ in range(k % 4):
+        pos = {i: (y, -x) for i, (x, y) in pos.items()}
+        yaw = {i: v - 90.0 for i, v in yaw.items()}
+    TOWER_ROT = k % 4
+    LAYOUTS["A"].clear(); LAYOUTS["A"].update(pos)
+    MARKER_YAW.clear(); MARKER_YAW.update(yaw)
+
+
+def _load_marker_map():
+    """marker_map.json (from calibrate_markers.py) overrides the nominal square. MARKER_MAP=off ignores it."""
+    global _BASE
+    rot = 0
+    if os.environ.get("MARKER_MAP") != "off" and os.path.exists(_MAP_PATH):
+        j = json.load(open(_MAP_PATH))
+        m = j["markers"]
+        _BASE = ({int(k): (float(v["x"]), float(v["y"])) for k, v in m.items()},
+                 {int(k): float(v["yaw"]) for k, v in m.items()})
+        rot = int(j.get("tower_rot90", 0))
+    else:
+        _BASE = (dict(LAYOUTS["A"]), {i: 0.0 for i in LAYOUTS["A"]})
+    _apply_rotation(rot)
+
+
+def set_tower_rotation(k, persist=True):
+    """Turn the tower frame (used when the bottom layer runs the other way). Saved next to the marker map."""
+    _apply_rotation(k)
+    if persist:
+        j = json.load(open(_MAP_PATH)) if os.path.exists(_MAP_PATH) else {
+            "markers": {str(i): {"x": x, "y": y, "yaw": 0.0} for i, (x, y) in _BASE[0].items()}, "marker_mm": 40.0}
+        j["tower_rot90"] = TOWER_ROT
+        json.dump(j, open(_MAP_PATH, "w"), indent=2)
+
+
+_load_marker_map()
 CENTRES = LAYOUTS["A"]
 DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 DETECTOR = cv2.aruco.ArucoDetector(DICT)
@@ -35,7 +80,9 @@ def marker_corners_3d(mid, rot, layout=None):
     h = MARKER_MM / 2
     base = [(-h, h), (h, h), (h, -h), (-h, -h)]  # TL TR BR BL, marker "up" = +y
     base = base[rot:] + base[:rot]                # rotate marker by 90deg * rot
-    return np.array([[cx + dx, cy + dy, 0.0] for dx, dy in base], np.float64)
+    yaw = np.radians(MARKER_YAW.get(mid, 0.0))    # measured orientation, if a marker map exists
+    c, sn = np.cos(yaw), np.sin(yaw)
+    return np.array([[cx + dx * c - dy * sn, cy + dx * sn + dy * c, 0.0] for dx, dy in base], np.float64)
 
 
 def load_frame(ts):
