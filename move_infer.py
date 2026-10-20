@@ -105,6 +105,32 @@ def _change(a, b):
     return float(np.abs(a[cy0:cy1, cx0:cx1] - al[cy0:cy1, cx0:cx1]).mean()), (dx, dy)
 
 
+def block_scores(run_dir, mark_ms, prev_mark_ms, start_ms, settle=0.8, after=4.5, use_sides=True):
+    """{(layer, slot): z} for EVERY block seen both before and after the tap: how strongly its picture changed.
+    Same measure as infer() uses (best face per camera, averaged over the cameras that saw it)."""
+    rows = _rows(run_dir)
+    a_lo = (prev_mark_ms + 1000) if prev_mark_ms else (start_ms + 500)
+    a_hi = min(a_lo + 3500, mark_ms - 2000)
+    if a_hi - a_lo < 1500:
+        return None
+    A = _window_means(run_dir, rows, a_lo, a_hi)
+    B = _window_means(run_dir, rows, mark_ms + settle * 1000, mark_ms + after * 1000)
+    common = sorted(k for k in set(A) & set(B) if use_sides or k[4] == "end")
+    if len(common) < 10:
+        return None
+    res = {k: _change(A[k], B[k]) for k in common}
+    base = {}
+    for kind in {k[4] for k in common}:
+        v = np.array([res[k][0] for k in common if k[4] == kind])
+        md = float(np.median(v))
+        base[kind] = (md, float(1.4826 * np.median(np.abs(v - md)) + 1e-3))
+    per = collections.defaultdict(dict)
+    for k in common:
+        z = (res[k][0] - base[k[4]][0]) / base[k[4]][1]
+        per[(k[1], k[2])][k[0]] = max(per[(k[1], k[2])].get(k[0], -99.0), float(z))
+    return {b: (float(np.mean(list(c.values()))) if len(c) >= 2 else max(c.values()) - 2.0) for b, c in per.items()}
+
+
 def infer(run_dir, mark_ms, prev_mark_ms, start_ms, pos, slots, candidates, settle=0.8, after=4.5, use_sides=True):
     """
     pos        'left' | 'middle' | 'right'

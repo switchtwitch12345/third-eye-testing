@@ -44,6 +44,11 @@ scripts/setup.sh                      # venv + dependencies + fetches STEPWISE i
 | `game_events.py`, `live_tracker.py` | Per-slot reader and move detector (offline and live) |
 | `rgb_cue.py`, `stepwise_adapter.py` | Colour cue; adapter into STEPWISE's depth reader |
 | `face_crops.py`, `extract_crops.py` | Face-crop dataset (`dataset/`, not in the repo) |
+| `jenga_rules.py`, `test_jenga_rules.py` | Red/green pull rules from balance (centre of mass over the layer below) plus house rules |
+| `move_infer.py`, `label_eval.py` | Which layer was pulled: compare the tower before/after a MARK in the typed column |
+| `tower_auto.py`, `calibrate_markers.py` | Layer count / direction from two cameras; measured marker positions |
+| `depth_protrusion.py`, `test_loose_replay.py`, `test_height_replay.py` | LiDAR: loose (pushed-out) blocks, and tower-height watch that declares game over when pieces fall |
+| `tap_report.py`, `geo_report.py`, `align_report.py`, `cluster_crops.py`, `camera_coverage.py` | Unlabelled-data analysis and best-view advice |
 | `calibrate_camera.py`, `android_cam.py` | Second-camera lens calibration / app-free capture |
 | `fuse_scan.py`, `tsdf_fuse.py`, `refined_fuse.py`, `process_scan.py` | Early mesh-reconstruction experiments (superseded) |
 

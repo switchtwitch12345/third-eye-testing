@@ -123,36 +123,65 @@ def solve(dets, K, rot=None, layout=None):
         return None
     ctr3 = np.array([[*layout[i], 0.0] for i in ids], np.float64)
     ctr2 = np.array([dets[i].mean(axis=0) for i in ids], np.float64)
-    best = None
+    cands = []                                       # stage-1 poses from the marker centres (possibly several: the fit is ambiguous)
     n, rv, tv, _ = cv2.solvePnPGeneric(ctr3, ctr2, K, None, flags=cv2.SOLVEPNP_IPPE if len(ids) >= 4 else cv2.SOLVEPNP_SQPNP)
     for r_, t_ in zip(rv, tv):
+        cands.append((r_, t_))
+    if len(ids) == 3:
+        # Three centres fit several different poses exactly (a low camera cannot tell them apart), and the solver
+        # may land on a wrong one.  Start from many viewpoints, keep every pose that fits, and let the corners decide.
+        dist = float(np.linalg.norm(cands[0][1])) if cands else 400.0
+        up = np.array([0.0, 0.0, 1.0])
+        for az in np.arange(0, 360, 45):
+            for el in (35.0, 55.0, 75.0):
+                a_, e_ = np.radians(az), np.radians(el)
+                C = dist * np.array([np.cos(e_) * np.cos(a_), np.cos(e_) * np.sin(a_), np.sin(e_)])
+                zc = -C / np.linalg.norm(C)
+                yc = -up - (-up @ zc) * zc
+                yc /= np.linalg.norm(yc)
+                xc = np.cross(yc, zc)
+                Rw = np.stack([xc, yc, zc])
+                ok_, r_, t_ = cv2.solvePnP(ctr3, ctr2, K, None, cv2.Rodrigues(Rw)[0], (-Rw @ C).reshape(3, 1), True,
+                                           flags=cv2.SOLVEPNP_ITERATIVE)
+                if ok_:
+                    cands.append((r_, t_))
+
+    def centre_err(r_, t_):
+        p, _ = cv2.projectPoints(ctr3, r_, t_, K, None)
+        return float(np.sqrt(np.mean(np.sum((p.reshape(-1, 2) - ctr2) ** 2, axis=1))))
+
+    def refine(rvec, tvec):
+        """stage 2: per-marker rotation that best explains the detected corners, then refine on corners"""
+        obj, img = [], []
+        for i in ids:
+            cand = []
+            for r in range(4):
+                c3 = marker_corners_3d(i, r, layout)
+                p, _ = cv2.projectPoints(c3, rvec, tvec, K, None)
+                cand.append((float(np.mean(np.linalg.norm(p.reshape(-1, 2) - dets[i], axis=1))), c3))
+            e, c3 = min(cand, key=lambda x: x[0])
+            obj.append(c3); img.append(dets[i])
+        obj = np.concatenate(obj); img = np.concatenate(img)
+        ok, rv2, tv2 = cv2.solvePnP(obj, img, K, None, rvec.copy(), tvec.copy(), True, flags=cv2.SOLVEPNP_ITERATIVE)
+        p, _ = cv2.projectPoints(obj, rv2, tv2, K, None)
+        return rv2, tv2, float(np.sqrt(np.mean(np.sum((p.reshape(-1, 2) - img) ** 2, axis=1))))
+
+    best, seen = None, []
+    for r_, t_ in cands:
         R_, _ = cv2.Rodrigues(r_)
         cam = -R_.T @ t_.reshape(3)
-        if cam[2] <= 0:
-            continue                                 # camera must be above the desk
-        p, _ = cv2.projectPoints(ctr3, r_, t_, K, None)
-        e = float(np.sqrt(np.mean(np.sum((p.reshape(-1, 2) - ctr2) ** 2, axis=1))))
-        if best is None or e < best[2]:
-            best = (r_, t_, e)
-    if best is None:
-        return None
-    rvec, tvec, cerr = best
-    # stage 2: per-marker rotation that best explains the detected corners, then refine on corners
-    obj, img = [], []
-    for i in ids:
-        cand = []
-        for r in range(4):
-            c3 = marker_corners_3d(i, r, layout)
-            p, _ = cv2.projectPoints(c3, rvec, tvec, K, None)
-            cand.append((float(np.mean(np.linalg.norm(p.reshape(-1, 2) - dets[i], axis=1))), c3))
-        e, c3 = min(cand, key=lambda x: x[0])
-        obj.append(c3); img.append(dets[i])
-    obj = np.concatenate(obj); img = np.concatenate(img)
-    ok, rvec, tvec = cv2.solvePnP(obj, img, K, None, rvec.copy(), tvec.copy(), True, flags=cv2.SOLVEPNP_ITERATIVE)
-    p, _ = cv2.projectPoints(obj, rvec, tvec, K, None)
-    err = float(np.sqrt(np.mean(np.sum((p.reshape(-1, 2) - img) ** 2, axis=1))))
-    R, _ = cv2.Rodrigues(rvec)
-    return R, tvec.reshape(3), err
+        if cam[2] <= 0 or centre_err(r_, t_) > 2.0:
+            continue                                 # camera must be above the desk, and the pose must fit the centres
+        if any(np.linalg.norm(cam - c) < 5.0 for c in seen):
+            continue                                 # same pose again
+        seen.append(cam)
+        rv2, tv2, err = refine(r_, t_)
+        R2, _ = cv2.Rodrigues(rv2)
+        if (-R2.T @ tv2.reshape(3))[2] <= 0:
+            continue
+        if best is None or err < best[2]:
+            best = (R2, tv2.reshape(3), err)
+    return best
 
 
 def depth_to_tower(fr, R, t, min_conf=2, dmax=1.5):

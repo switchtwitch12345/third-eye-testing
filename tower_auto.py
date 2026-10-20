@@ -76,7 +76,7 @@ def prepare(views):
     return out
 
 
-def height(prep, z_lo=60.0, z_hi=255.0, step=3.0, half=35.0, px=3):
+def height(prep, z_lo=60.0, z_hi=300.0, step=3.0, half=35.0, px=3):
     """Top-surface height by two-camera agreement.  Returns (z_mm or None, peak ncc, curve)."""
     if len(prep) < 2:
         return None, None, []
@@ -155,7 +155,7 @@ def analyse_burst(grab, n=8, interval=0.3, layers_hint=None):
             prep[name] = (und, best[name][1], best[name][2], best[name][3], best[name][4])
         if len(prep) >= 2:
             (n1, a), (n2, b) = list(prep.items())[:2]
-            grid = np.arange(60.0, 255.1, 3.0)
+            grid = np.arange(60.0, 300.1, 3.0)
             cur = []
             for z in grid:
                 ra = _grey_hp(rectify(a[0], a[1], a[2], a[3], z, 35.0, 3))
@@ -180,11 +180,13 @@ def analyse_burst(grab, n=8, interval=0.3, layers_hint=None):
     lo = int(np.searchsorted(zs, 45.0))
     cand = [j for j in range(lo, len(drop)) if avg[j] >= 0.10 and drop[j] >= 0.18]
     if not cand:
-        res["reason"] = f"no clear top edge in the two-camera agreement (steepest drop {drop[lo:].max():.2f})"
+        res["reason"] = (f"no clear top edge in the two-camera agreement (steepest drop {drop[lo:].max():.2f}); "
+                         "on a very tall tower, type the layer count by hand")
         res["ncc"] = float(avg.max())
         return res
     i = max(cand, key=lambda j: drop[j])
-    res["ncc"], res["z"] = float(avg[i]), float(zs[i] + 1.5)
+    z_top = float(zs[i] + 1.5)
+    res["ncc"], res["z"] = float(avg[i]), z_top
     zs = zs.copy(); zs[i] = res["z"]
     res["layers"] = int(round(zs[i] / LAYER_MM))
     # direction, from the last frames at the found height
