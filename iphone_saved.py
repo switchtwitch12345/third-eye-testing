@@ -45,10 +45,10 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 _lock = threading.Lock()
 _state = {
     "jpeg": None, "markers": [], "preview_t": 0.0, "capturing": False, "saved": 0,
-    "tracking": "?", "marks": 0, "want": None, "mark_seq": 0, "files": 0, "want_mesh": False, "mesh_files": 0,
+    "tracking": "?", "marks": 0, "want": None, "mark_seq": 0, "files": 0,
     "android_jpeg": None, "android_raw": None, "jpeg_raw": None, "android_markers": [], "android_t": 0.0,
     "android_saved": 0, "android_size": None,
-    "tower": {"layers": 10, "removed": []}, "overlay": None, "android_overlay": None,
+    "tower": {"layers": 10, "removed": []}, "loose": [], "loose_info": None, "game_over": None, "height_info": None, "overlay": None, "android_overlay": None,
     "autotower": {"status": "waiting for both cameras"}, "marks_log": [], "last_label": None, "label_stats": {"moves": 0, "wrong": 0}, "autotower_lock": True, "autotower_last": "none yet", "autotower_redetect": False, "tower_epoch": 0, "tracker_msg": "tracker idle - press START", "tracker_on": False,
     "dataset": {"on": False, "name": None, "frames": 0, "crops": 0, "total_crops": 0, "total_frames": 0}, "started": time.time(), "image_size": None,
 }
@@ -82,7 +82,7 @@ button{background:#22262d;color:var(--ink);border:1px solid #333944;border-radiu
 font-size:14px;cursor:pointer;margin-top:14px;width:100%}
 .hint{color:var(--dim);font-size:13px;margin-top:14px}
 @media(max-width:800px){.wrap{grid-template-columns:1fr;grid-template-rows:1fr auto}}
-</style></head><body><div class="wrap">
+</style></head><body><div id="nomoves" style="display:none;position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:50;background:#c0281c;color:#fff;font:800 30px -apple-system,Roboto,sans-serif;padding:14px 34px;border-radius:12px;box-shadow:0 4px 24px #000a">NO MOVES LEFT &mdash; every remaining block would topple the tower</div><div class="wrap">
 <div class="view">
   <div class="pane"><div class="plabel">iPhone · LiDAR <span id="lbA" class="tag">no signal</span></div><canvas id="c" width="960" height="720"></canvas></div>
   <div class="pane"><div class="plabel">Android <span id="lbB" class="tag">no signal</span></div><canvas id="c2" width="960" height="540"></canvas></div>
@@ -108,9 +108,6 @@ font-size:14px;cursor:pointer;margin-top:14px;width:100%}
   <div class="row"><span>Phone tracking</span><span id="trk">–</span></div>
   <h1 style="margin-top:22px">Camera 2 (Android browser)</h1>
   <div id="amk" class="chip idle">not connected</div>
-  <h1 style="margin-top:22px">ARKit mesh test</h1>
-  <button id="bMesh" style="background:#2a2a45;border-color:#4a4a80">Turn ARKit mesh ON</button>
-  <div id="minfo" class="hint">off. Exports ARKit's own fused mesh about once a second while recording, to measure how fine it is.</div>
   <h1 style="margin-top:22px">Training data</h1>
   <button id="bData" style="background:#16324a;border-color:#2b5f8a">Start data capture</button>
   <div id="dinfo" class="hint">off. Records both cameras and cuts out every block face. Play normally;
@@ -172,8 +169,6 @@ let dataOn=false;
 document.getElementById('bCover').onclick=async()=>{const p=document.getElementById('cover');p.style.display='block';p.textContent='measuring...';p.textContent=await (await fetch('/coverage.txt')).text();};
 document.getElementById('bRedetect').onclick=()=>fetch('/cmd/redetect',{method:'POST'});
 document.getElementById('bData').onclick=()=>fetch('/cmd/dataset/'+(dataOn?'off':'on'),{method:'POST'});
-let meshOn=false;
-document.getElementById('bMesh').onclick=()=>fetch('/cmd/mesh/'+(meshOn?'off':'on'),{method:'POST'});
 document.getElementById('bStart').onclick=()=>cmd('start');
 document.getElementById('bStop').onclick=()=>cmd('stop');
 document.getElementById('bMark').onclick=()=>cmd('mark');
@@ -207,14 +202,15 @@ async function poll(){
     tag($('lbA'),live,s.markers);
     tag($('lbB'),s.android_age!==null&&s.android_age<10,s.android_markers);
     $('trk').textContent=s.tracking;
-    meshOn=!!s.want_mesh; const mb=$('bMesh');
-    mb.textContent=meshOn?'Turn ARKit mesh OFF':'Turn ARKit mesh ON';
-    $('minfo').textContent=meshOn?('ON · mesh files received: '+s.mesh_files):'off · exports ARKit\'s fused mesh ~1/s while recording';
     const ds=s.dataset||{}; dataOn=!!ds.on;
     const db=$('bData'); db.textContent=dataOn?'■ Stop data capture':'Start data capture';
     db.style.background=dataOn?'#5a1a16':'#16324a';
     $('dinfo').textContent=dataOn?('RECORDING DATA · this run: '+ds.frames+' frames, '+ds.crops+' crops · all runs: '+(ds.total_crops||0)+' crops')
       :('off · '+(ds.total_crops||0)+' crops saved so far');
+    if(s.tower&&document.activeElement!==$('tr')&&document.activeElement!==$('tl')){
+      $('tr').value=s.tower.removed.map(b=>'L'+(b[0]+1)+'S'+b[1]).join(' '); $('tl').value=s.tower.layers; }
+    $('nomoves').style.display=(s.no_moves||s.game_over)?'block':'none';
+    $('nomoves').textContent=s.game_over?('GAME OVER \u2014 '+s.game_over.reason):'NO MOVES LEFT \u2014 every remaining block would topple the tower';
     const ll=s.last_label, st=s.label_stats||{}, lr=$('lres');
     if(ll){ lr.textContent=(ll.message||ll.status)+(st.moves?('   ['+(st.moves-st.wrong)+'/'+st.moves+' right so far; no correction counts as right]'):'');
       lr.className='chip '+(ll.status==='error'?'bad':ll.status==='done'?(ll.confident?'ok':'warn'):'idle'); }
@@ -223,7 +219,7 @@ async function poll(){
     const au=s.autotower||{}; $('tauto').textContent='auto-detect: '+(au.status||'–')+(au.note?(' · '+au.note):'');
     const tm=$('tmsg'); tm.textContent=s.tracker_msg;
     tm.className='chip '+(s.tracker_msg.indexOf('could not')>=0||s.tracker_msg.indexOf('error')>=0||s.tracker_msg.indexOf('COLLAPSED')>=0?'bad':s.tracker_msg.indexOf('ready')===0||s.tracker_msg.indexOf('move')===0?'ok':'idle');
-    $('tcount').textContent=ov?('green '+ov.green+'  ·  red '+ov.red):'overlay needs 2+ markers in view';
+    $('tcount').textContent=ov?('green '+ov.green+(ov.amber?'  ·  amber (loose) '+ov.amber:'')+'  ·  red '+ov.red)+(s.height_info?('  ·  LiDAR height ≈ '+s.height_info.lidar_layers+' layers'):''):'overlay needs 2+ markers in view';
     $('pfps').textContent=live?s.preview_fps.toFixed(1)+' fps':'–';
     $('ups').textContent=s.upload_rate.toFixed(1)+' files/s  ('+s.files+' total)';
     $('age').textContent=s.upload_age===null?'–':s.upload_age.toFixed(1)+' s ago';
@@ -281,7 +277,7 @@ Screen stays on. Frames are only saved while the iPhone is recording.</div>
 
 # --- red / green overlay -------------------------------------------------------------------
 IPHONE_K_1920 = (1399.0082, 1399.0082, 964.9536, 717.8016, 1920)   # this iPhone's intrinsics @ 1920 px
-GREEN, RED = (60, 200, 60), (50, 50, 235)
+GREEN, RED, AMBER = (60, 200, 60), (50, 50, 235), (0, 165, 255)
 _HALF, _WIDTH, _HEIGHT = 37.5, 25.0, 15.0
 
 
@@ -319,21 +315,9 @@ def _box(layer, slot):
 
 
 def removable(layers, removed):
-    """(layer, slot) -> True if that block may be pulled.  Jenga: only layers below the highest
-    complete layer; and the layer must stay standing -- two blocks left, or just the middle one."""
-    occ = {(l, s): (l, s) not in removed for l in range(layers) for s in range(3)}
-    counts = [sum(occ[(l, s)] for s in range(3)) for l in range(layers)]
-    top_complete = max([l for l in range(layers) if counts[l] == 3], default=-1)
-    out = {}
-    for (l, s), here in occ.items():
-        if not here:
-            continue
-        if l >= top_complete:
-            out[(l, s)] = False
-            continue
-        rest = [u for u in range(3) if u != s and occ[(l, u)]]
-        out[(l, s)] = len(rest) >= 2 or rest == [1]
-    return out
+    """(layer, slot) -> True if that block may be pulled; the rules and their reasons are in jenga_rules.py"""
+    import jenga_rules
+    return jenga_rules.removable(layers, removed)
 
 
 _FACES = [(0, 1, 3, 2), (4, 5, 7, 6), (0, 1, 5, 4), (2, 3, 7, 6), (0, 2, 6, 4), (1, 3, 7, 5)]
@@ -380,6 +364,25 @@ def _ruler(img, K, R, t, cam, layers):
 
 
 _last_pose = {}      # kind -> (R, t, time): a phone on a stand does not move in a second
+_pose_lock = {}      # kind -> (R, t): the last good pose; phones sit on stands, so it stays valid until they are bumped
+_lock_valid = {}     # kind -> time the lock was last confirmed (3+ markers, or visible markers still land where it says)
+
+
+def _banner(img, text):
+    """Big red label across the top of the picture."""
+    h, w = img.shape[:2]
+    scale = w / 640.0
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, max(2, int(3 * scale)))
+    x0, y0 = (w - tw) // 2 - int(14 * scale), int(10 * scale)
+    cv2.rectangle(img, (x0, y0), (x0 + tw + int(28 * scale), y0 + th + int(24 * scale)), (30, 30, 200), -1)
+    cv2.putText(img, text, (x0 + int(14 * scale), y0 + th + int(12 * scale)), cv2.FONT_HERSHEY_SIMPLEX, scale,
+                (255, 255, 255), max(2, int(3 * scale)), cv2.LINE_AA)
+
+
+def _no_moves(tower):
+    """True when blocks remain but every one of them is red: nothing can be pulled any more."""
+    ok = removable(int(tower["layers"]), {tuple(r) for r in tower["removed"]})
+    return bool(ok) and not any(ok.values())
 
 
 def _draw_overlay(img, K, dist, dets, tower, kind=None):
@@ -398,14 +401,34 @@ def _draw_overlay(img, K, dist, dets, tower, kind=None):
         R, t, _ = sol
         if kind:
             _last_pose[kind] = (R, t, time.time())
-    else:                                  # a dropped marker for a moment: keep the last good pose briefly
+            _pose_lock[kind] = (R, t)
+            _lock_valid[kind] = time.time()
+    elif kind and dets and kind in _pose_lock:      # fewer than 3 markers: do the ones we see still sit where the lock says?
+        try:
+            Rl, tl = _pose_lock[kind]
+            errs = []
+            for i, c in dets.items():
+                if i not in _tp.LAYOUTS["A"]:
+                    continue
+                x, y = _tp.LAYOUTS["A"][i]
+                uvw = K @ (Rl @ np.array([x, y, 0.0]) + tl)
+                errs.append(float(np.linalg.norm(uvw[:2] / uvw[2] - c.mean(axis=0))))
+            if errs and max(errs) < 12.0:
+                _lock_valid[kind] = time.time()
+        except Exception:
+            pass
+    if not sol:                            # a dropped marker for a moment: keep the last good pose briefly
         held = _last_pose.get(kind)
-        if not held or time.time() - held[2] > 1.5:
+        if held and time.time() - held[2] <= 1.5:
+            R, t, _ = held
+        elif kind in _pose_lock and time.time() - _lock_valid.get(kind, 0) <= 6.0:
+            R, t = _pose_lock[kind]        # markers covered, but the ones still visible say the phone has not moved
+        else:
             return None
-        R, t, _ = held
     layers = int(tower["layers"])
     removed = {tuple(r) for r in tower["removed"]}
     ok = removable(layers, removed)
+    loose = {tuple(b) for b in tower.get("loose", [])}
     cam = -R.T @ t
     items = []
     for (l, s), good in ok.items():
@@ -414,7 +437,7 @@ def _draw_overlay(img, K, dist, dets, tower, kind=None):
     items.sort(reverse=True)               # far blocks first, so near ones paint over them
     fill = img.copy()
     for _d, l, s, good, lo, hi in items:
-        col = GREEN if good else RED
+        col = (AMBER if (l, s) in loose else GREEN) if good else RED
         C = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
         uvw = (C @ R.T + t) @ K.T
         if (uvw[:, 2] <= 0).any():
@@ -439,7 +462,12 @@ def _draw_overlay(img, K, dist, dets, tower, kind=None):
             cv2.polylines(img, [quad.reshape(-1, 1, 2)], True, col, 2, cv2.LINE_AA)
     cv2.addWeighted(fill, 0.38, img, 0.62, 0, img)
     _ruler(img, K, R, t, cam, layers)
-    return {"green": int(sum(ok.values())), "red": int(len(ok) - sum(ok.values()))}
+    if tower.get("game_over"):
+        _banner(img, "GAME OVER - PIECES FELL")
+    elif ok and not any(ok.values()):
+        _banner(img, "NO MOVES LEFT")
+    n_amber = sum(1 for k, g in ok.items() if g and k in loose)
+    return {"green": int(sum(ok.values())) - n_amber, "amber": n_amber, "red": int(len(ok) - sum(ok.values()))}
 
 
 def _annotate(jpeg_bytes, kind=None):
@@ -463,7 +491,7 @@ def _annotate(jpeg_bytes, kind=None):
         K, dist = _k_iphone(w) if kind == "iphone" else _k_android(w, h)
         if K is not None:
             with _lock:
-                tower = dict(_state["tower"])
+                tower = dict(_state["tower"]); tower["loose"] = list(_state.get("loose", [])); tower["game_over"] = _state.get("game_over")
             try:
                 stats = _draw_overlay(img, K, dist, dets, tower, kind)
             except Exception:
@@ -472,6 +500,104 @@ def _annotate(jpeg_bytes, kind=None):
             _state["overlay" if kind == "iphone" else "android_overlay"] = stats
     ok, out = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
     return (out.tobytes() if ok else jpeg_bytes), found
+
+
+LOOSE_MM = 5.0         # a face this much closer to the iPhone than it was at the start of the game is sticking out
+_loose_st = {"epoch": None, "layers": None, "base": {}, "hist": {}}
+
+
+DROP_MM = 20.0         # the top of the tower falling by more than a layer (15 mm) means pieces fell: pulls never lower it
+_height_st = {"epoch": None, "layers": None, "ref": [], "hist": []}
+
+
+def _watch_height(P, epoch, layers):
+    """Top-of-tower height from the depth points over the tower's core.  A legal turn never changes it (the top
+    complete layer cannot be pulled), so a drop of more than a layer for 3 readings in a row = game over."""
+    if (_height_st["epoch"], _height_st["layers"]) != (epoch, layers):
+        _height_st.update(epoch=epoch, layers=layers, ref=[], hist=[])
+        with _lock:
+            _state["game_over"] = None
+    core = (np.abs(P[:, 0]) < 30) & (np.abs(P[:, 1]) < 30) & (P[:, 2] > 20)
+    z = P[core, 2]
+    if len(z) < 60:
+        return
+    top = float(np.percentile(z, 95))
+    if len(_height_st["ref"]) < 8:
+        _height_st["ref"].append(top)                # the first readings of a new tower: its normal height
+        return
+    ref = float(np.median(_height_st["ref"]))
+    _height_st["hist"] = (_height_st["hist"] + [top])[-5:]
+    cur = float(np.median(_height_st["hist"]))
+    with _lock:
+        _state["height_info"] = {"top_mm": round(cur, 1), "start_mm": round(ref, 1),
+                                 "lidar_layers": int(round((ref - 2.0) / 15.0)), "at": time.strftime("%H:%M:%S")}
+        if len(_height_st["hist"]) >= 3 and cur <= ref - DROP_MM and not _state["game_over"]:
+            _state["game_over"] = {"reason": f"the top of the tower dropped {ref - cur:.0f} mm "
+                                             f"(about {(ref - cur) / 15:.1f} layers): pieces fell",
+                                   "at": time.strftime("%H:%M:%S")}
+
+
+def _process_depth(h, body):
+    """One depth frame from the iPhone: how far does each visible block face stick out compared with the start?"""
+    import collections
+    import depth_protrusion as dp
+    w, hh = int(h["X-W"]), int(h["X-H"])
+    n = w * hh
+    if len(body) < 5 * n:
+        return
+    now = time.time()
+    held = _last_pose.get("iphone")
+    live = bool(held and now - held[2] <= 3.0)
+    if live:
+        R, t, _ = held
+    elif "iphone" in _pose_lock and now - _lock_valid.get("iphone", 0) <= 6.0:
+        R, t = _pose_lock["iphone"]            # markers hidden (fallen blocks?), but the phone has not moved
+    else:
+        return
+    depth = np.frombuffer(body[:4 * n], np.float32).reshape(hh, w)
+    conf = np.frombuffer(body[4 * n:5 * n], np.uint8).reshape(hh, w)
+    K = np.array([[float(h["X-Fx"]), 0, float(h["X-Cx"])], [0, float(h["X-Fy"]), float(h["X-Cy"])], [0, 0, 1.0]])
+    with _lock:
+        layers, epoch = int(_state["tower"]["layers"]), _state["tower_epoch"]
+        removed = {tuple(r) for r in _state["tower"]["removed"]}
+    if (_loose_st["epoch"], _loose_st["layers"]) != (epoch, layers):
+        _loose_st.update(epoch=epoch, layers=layers, base={}, hist={}, streak={})       # new tower: learn its faces afresh
+    P = dp.depth_points(depth, conf, K, int(h["X-RgbW"]), int(h["X-RgbH"]), R, t)
+    _watch_height(P, epoch, layers)
+    if not live:
+        return
+    offs = dp.face_offsets(P, -R.T @ t, layers)
+    loose, worst = set(), 0.0
+    for (l, s, sign), (v, _n) in offs.items():
+        if (l, s) in removed:
+            continue
+        k = (l, s, sign)
+        b = _loose_st["base"].setdefault(k, [])
+        if len(b) < 6:                       # the first readings of a face define "untouched"
+            b.append(v)
+            continue
+        if np.std(b) > 3.0:                  # a face whose first readings jump about (grazing angle, edge of view): untrustworthy
+            continue
+        hist = _loose_st["hist"].setdefault(k, collections.deque(maxlen=5))
+        hist.append(v)
+        if len(hist) >= 3:
+            prot = float(np.median(hist) - np.median(b))
+            if prot > 30.0:                  # nothing a block does moves it that far: a hand or a glitch, not a loose block
+                continue
+            worst = max(worst, prot)
+            if prot >= LOOSE_MM:
+                loose.add((l, s))
+    streak = _loose_st.setdefault("streak", {})       # a block must look loose twice running: one odd reading is not enough
+    for b in list(streak):
+        if b not in loose:
+            del streak[b]
+    for b in loose:
+        streak[b] = streak.get(b, 0) + 1
+    loose = {b for b in loose if streak[b] >= 2}
+    with _lock:
+        _state["loose"] = sorted([l, s] for l, s in loose)
+        _state["loose_info"] = {"faces_seen": len(offs), "faces_with_baseline": sum(1 for b in _loose_st["base"].values() if len(b) >= 6),
+                                "most_out_mm": round(worst, 1), "at": time.strftime("%H:%M:%S")}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -536,8 +662,7 @@ class Handler(BaseHTTPRequestHandler):
                 "android_markers": s["android_markers"], "android_saved": s["android_saved"],
                 "android_age": (now - s["android_t"]) if s["android_t"] else None,
                 "android_size": s["android_size"], "android_dbg": list(_android_dbg)[-12:], "tower": s["tower"], "tracker_msg": s["tracker_msg"], "tracker_on": s["tracker_on"], "dataset": s["dataset"], "autotower": s["autotower"], "last_label": s["last_label"], "label_stats": s["label_stats"], "marks_pending": sum(1 for m in s["marks_log"] if not m["labelled"]),
-                "want_mesh": s["want_mesh"], "mesh_files": s["mesh_files"],
-                "overlay": s["overlay"], "android_overlay": s["android_overlay"],
+                "overlay": s["overlay"], "android_overlay": s["android_overlay"], "loose": s["loose"], "loose_info": s["loose_info"], "no_moves": _no_moves(s["tower"]), "game_over": s["game_over"], "height_info": s["height_info"],
             }).encode()
             self._send(200, body, "application/json")
         else:
@@ -554,19 +679,20 @@ class Handler(BaseHTTPRequestHandler):
                 with _lock:
                     _state["tower"] = {"layers": layers, "removed": removed}
                     _state["tower_epoch"] += 1
+                    _state["game_over"] = None
                 self._send(200, b"OK")
             except Exception as e:
                 self._send(400, f"bad tower: {e}".encode())
-            return
-        if self.path.startswith("/cmd/mesh/"):
-            with _lock:
-                _state["want_mesh"] = self.path.endswith("/on")
-            self._send(200, b"OK")
             return
         if self.path == "/cmd/label":
             try:
                 import move_infer as mi
                 text = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}").get("text", "")
+                if re.search(r"\b(fell|fall|fallen|collapse|collapsed|knocked|over)\b", text.lower()):
+                    with _lock:
+                        _state["game_over"] = {"reason": "you reported that pieces fell", "at": time.strftime("%H:%M:%S")}
+                    self._send(200, b"OK")
+                    return
                 pos, layer = mi.parse_text(text)
                 with _lock:
                     todo = [m for m in _state["marks_log"] if not m["labelled"]]
@@ -578,6 +704,12 @@ class Handler(BaseHTTPRequestHandler):
                             _state["label_stats"]["wrong"] += 1
                         _state["last_label"] = dict(last, corrected=True, message=last["message"].split(". Wrong?")[0].split(". NOT CONFIDENT")[0]
                                                     + f". Corrected by you to layer {layer}")
+                    if last.get("block") is not None and last.get("pos_slots", {}).get(layer - 1) is not None:
+                        old_b, new_b = list(last["block"]), [layer - 1, last["pos_slots"][layer - 1]]
+                        with _lock:       # swap the wrongly marked block for the real one
+                            rem = [b for b in _state["tower"]["removed"] if list(b) not in (old_b, new_b)]
+                            _state["tower"] = {"layers": _state["tower"]["layers"], "removed": rem + [new_b]}
+                            _state["last_label"]["block"] = new_b
                     try:
                         ds = _state["dataset"].get("name")
                         with open(os.path.join(HERE, "dataset", ds, "labels.jsonl"), "a") as f:
@@ -671,6 +803,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(500, f"android error: {e}".encode())
             return
+        if self.path == "/depth":
+            try:
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                _process_depth(self.headers, body)
+            except Exception as e:
+                print("depth frame skipped:", type(e).__name__, e)
+            self._send(200, b"OK")
+            return
         if self.path == "/preview":
             try:
                 n = int(self.headers.get("Content-Length", 0))
@@ -686,7 +826,7 @@ class Handler(BaseHTTPRequestHandler):
                     _preview_times.append(time.time())
                     if _state["want"] is not None and _state["capturing"] == _state["want"]:
                         _state["want"] = None
-                    reply = {"capture": _state["want"], "mark_seq": _state["mark_seq"], "mesh": _state["want_mesh"]}
+                    reply = {"capture": _state["want"], "mark_seq": _state["mark_seq"]}
                 self._send(200, json.dumps(reply).encode(), "application/json")
             except Exception as e:
                 self._send(500, f"preview error: {e}".encode())
@@ -714,8 +854,6 @@ class Handler(BaseHTTPRequestHandler):
                             f.write(file_data)
                         with _lock:
                             _state["files"] += 1
-                            if filename.endswith("_mesh.bin"):
-                                _state["mesh_files"] += 1
                             _upload_times.append(time.time())
                         print(f"✅ Saved: {filename} ({len(file_data):,} bytes)")
                     except Exception as e:
@@ -845,6 +983,8 @@ def _dataset_loop():
                 with _lock:
                     _state["dataset"].update(name=name, frames=0, crops=0)
             if writer is not None:
+                with _lock:
+                    writer.layers = max(1, min(18, int(_state["tower"]["layers"])))
                 writer.step()
                 with _lock:
                     _state["dataset"].update(frames=writer.counts["frames"], crops=writer.counts["crops"],
@@ -917,7 +1057,7 @@ def _autotower_loop():
                         continue
                     k0 = _tp.TOWER_ROT
                     _tp.set_tower_rotation(min(((k0 + 1) % 4, (k0 - 1) % 4), key=lambda k: min(k, 4 - k)))
-                    _last_pose.clear()
+                    _last_pose.clear(); _pose_lock.clear(); _lock_valid.clear()
                     time.sleep(1.0)
                     continue                         # the frame changed: measure again to confirm
                 final = (L, axis, r)
@@ -982,7 +1122,18 @@ def _label_job(entry, pos, user_layer):
                 msg += f". You said layer {user_layer}: {'MATCH' if agree else 'different'}"
             else:
                 msg += ". Wrong? type the real layer number and press Enter"
-            say(status="done", message=msg, layer=r["layer"], confident=r["confident"], top=r["top"])
+            # the pulled block is gone for good: feed it to the red/green rules (your typed layer wins over the model)
+            blk = None
+            pull_layer = user_layer or r["layer"]
+            slot = slots.get(pull_layer - 1, {}).get(pos) if 1 <= pull_layer <= layers else None
+            if slot is not None:
+                blk = [pull_layer - 1, slot]
+                with _lock:
+                    rem = [b for b in _state["tower"]["removed"] if list(b) != blk]
+                    _state["tower"] = {"layers": _state["tower"]["layers"], "removed": rem + [blk]}
+                msg += f". Marked layer {pull_layer} slot {slot} as removed"
+            say(status="done", message=msg, layer=r["layer"], confident=r["confident"], top=r["top"],
+                block=blk, pos_slots={l: s[pos] for l, s in slots.items()})
         with open(os.path.join(run_dir, "labels.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
     except Exception as e:

@@ -22,7 +22,7 @@ sys.path.insert(0, HERE)
 HALF, WIDTH, HEIGHT = 37.5, 25.0, 15.0
 OUT_W, OUT_H = 100, 60
 MARGIN = 0.25
-MAX_LAYERS = 12
+MAX_LAYERS = 18          # a full Jenga tower
 MIN_COS = 0.20            # skip faces seen almost edge-on
 DET = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))
 
@@ -169,6 +169,7 @@ class DatasetWriter:
         self.last_pose = {"iphone": None, "android": None}
         self.counts = {"frames": 0, "crops": 0, "skipped_no_pose": 0}
         self.t0 = None
+        self.layers = MAX_LAYERS            # the viewer keeps this equal to the tower's real height
         os.makedirs(out, exist_ok=True)
         self.index = open(os.path.join(out, "index.jsonl"), "a")
 
@@ -181,7 +182,7 @@ class DatasetWriter:
 
     def _write(self, cam, ts, img, K, pose, src):
         R, t, err = pose
-        for layer, slot, sign, cos, crop in crops_for_frame(img, K, R, t):
+        for layer, slot, sign, cos, crop in crops_for_frame(img, K, R, t, self.layers):
             fn = f"{cam}/{ts}_L{layer}_S{slot}_{'p' if sign > 0 else 'm'}.jpg"
             path = os.path.join(self.out, fn)
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -190,7 +191,7 @@ class DatasetWriter:
                                          "layer": layer, "slot": slot, "sign": sign, "cos": round(cos, 3),
                                          "pose_src": src, "reproj": round(err, 2), "file": fn}) + "\n")
             self.counts["crops"] += 1
-        for layer, slot, sign, cos, crop in side_crops_for_frame(img, K, R, t):
+        for layer, slot, sign, cos, crop in side_crops_for_frame(img, K, R, t, self.layers):
             fn = f"{cam}/{ts}_L{layer}_S{slot}_{'p' if sign > 0 else 'm'}_side.jpg"
             path = os.path.join(self.out, fn)
             cv2.imwrite(path, crop, [cv2.IMWRITE_JPEG_QUALITY, self.q])

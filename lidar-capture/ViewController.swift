@@ -20,6 +20,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     let previewQueue = DispatchQueue(label: "com.lidarcapture.preview")
     let previewContext = CIContext()
     var previewBusy = false
+    var previewCount = 0       // every 5th live preview also carries that frame's depth (for the loose-block warning)
     var uploadsAttempted = 0
     var uploadsFailed = 0
     var statusLabel: UILabel!
@@ -27,8 +28,6 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     var markButton: UIButton!
     var markCount = 0
     var lastMarkSeq: Int? = nil
-    var meshTest = false
-    var lastMeshExport = Date.distantPast
     var ipAddressField: UITextField!
     let saveQueue = DispatchQueue(label: "com.lidarcapture.savequeue")
     let sessionID = UUID().uuidString  // new value each app launch — frames from different launches don't share a world origin
@@ -289,10 +288,6 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
             }
         }
         
-        if meshTest && Date().timeIntervalSince(lastMeshExport) > 1.0 {
-            lastMeshExport = Date()
-            exportMesh(frame)
-        }
         if totalFrames % 6 == 0 && !previewBusy {  // ~10 fps live view on the Mac, capturing or not
             sendPreview(frame)
         }
@@ -365,10 +360,6 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
 
     // MARK: - Remote control from the Mac viewer (so nobody has to touch the phone)
     func handleRemote(_ cmd: [String: Any]) {
-        if let m = cmd["mesh"] as? Bool, m != meshTest {
-            meshTest = m
-            applyMeshMode(m)
-        }
         if let want = cmd["capture"] as? Bool, want != isCapturing {
             toggleCapture()
         }
@@ -380,62 +371,15 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         }
     }
 
-    // MARK: - ARKit mesh test (off by default; switched on from the Mac viewer)
-    func applyMeshMode(_ on: Bool) {
-        let config = ARWorldTrackingConfiguration()
-        config.frameSemantics = [.sceneDepth]
-        if on { config.sceneReconstruction = .mesh }
-        sceneView.session.run(config)          // no reset options: world tracking carries on
-        print(on ? "🧱 ARKit mesh ON (exporting ~1/s)" : "🧱 ARKit mesh OFF")
-    }
-
-    /// Binary dump of every nearby ARMeshAnchor in WORLD coordinates (metres):
-    ///   "MSH1" | u32 anchorCount | 16 x f32 camera transform (column-major)
-    ///   per anchor: u32 vertexCount | u32 faceCount | vertexCount x (f32 x,y,z) | faceCount x (u32 a,b,c)
-    func exportMesh(_ frame: ARFrame) {
-        let anchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
-        guard !anchors.isEmpty else { return }
-        let cam = frame.camera.transform
-        let camPos = SIMD3<Float>(cam.columns.3.x, cam.columns.3.y, cam.columns.3.z)
-        let ts = Int(Date().timeIntervalSince1970 * 1000)
-        saveQueue.async {
-            var data = Data()
-            func put<T>(_ v: T) { var x = v; withUnsafeBytes(of: &x) { data.append(contentsOf: $0) } }
-            let near = anchors.filter { a in
-                let p = SIMD3<Float>(a.transform.columns.3.x, a.transform.columns.3.y, a.transform.columns.3.z)
-                return simd_distance(p, camPos) < 2.5
-            }
-            data.append(contentsOf: Array("MSH1".utf8))
-            put(UInt32(near.count))
-            for i in 0..<4 { for j in 0..<4 { put(cam[i][j]) } }
-            for a in near {
-                let g = a.geometry
-                let vc = g.vertices.count, fc = g.faces.count
-                put(UInt32(vc)); put(UInt32(fc))
-                let vb = g.vertices.buffer.contents()
-                for v in 0..<vc {
-                    let p = vb.advanced(by: g.vertices.offset + g.vertices.stride * v).assumingMemoryBound(to: Float.self)
-                    let w = a.transform * SIMD4<Float>(p[0], p[1], p[2], 1)
-                    put(w.x); put(w.y); put(w.z)
-                }
-                let fb = g.faces.buffer.contents()
-                let bpi = g.faces.bytesPerIndex
-                for f in 0..<fc {
-                    for k in 0..<3 {
-                        let idx = fb.advanced(by: (f * 3 + k) * bpi).assumingMemoryBound(to: UInt32.self).pointee
-                        put(idx)
-                    }
-                }
-            }
-            self.uploadFile(data: data, filename: "\(ts)_mesh.bin", type: "application/octet-stream")
-        }
-    }
-
     // MARK: - Live preview (viewer page on the Mac; never saved to disk)
     func sendPreview(_ frame: ARFrame) {
         guard let ip = ipAddressField.text, !ip.isEmpty,
               let url = URL(string: "http://\(ip):8000/preview") else { return }
         previewBusy = true
+        previewCount += 1
+        let depthPayload: (body: Data, w: Int, h: Int)? = (previewCount % 5 == 0) ? packDepth(frame) : nil
+        let intr = frame.camera.intrinsics
+        let rgbSize = frame.camera.imageResolution
         let buffer = frame.capturedImage
         let capturing = isCapturing
         let saved = frameCount / saveEvery
@@ -464,6 +408,22 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
             request.setValue(tracking, forHTTPHeaderField: "X-Tracking")
             request.setValue("\(marks)", forHTTPHeaderField: "X-Marks")
             request.httpBody = jpeg
+            if let dp = depthPayload, let durl = URL(string: "http://\(ip):8000/depth") {
+                var dreq = URLRequest(url: durl)
+                dreq.httpMethod = "POST"
+                dreq.timeoutInterval = 2
+                dreq.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+                dreq.setValue("\(dp.w)", forHTTPHeaderField: "X-W")
+                dreq.setValue("\(dp.h)", forHTTPHeaderField: "X-H")
+                dreq.setValue("\(intr.columns.0.x)", forHTTPHeaderField: "X-Fx")
+                dreq.setValue("\(intr.columns.1.y)", forHTTPHeaderField: "X-Fy")
+                dreq.setValue("\(intr.columns.2.x)", forHTTPHeaderField: "X-Cx")
+                dreq.setValue("\(intr.columns.2.y)", forHTTPHeaderField: "X-Cy")
+                dreq.setValue("\(Int(rgbSize.width))", forHTTPHeaderField: "X-RgbW")
+                dreq.setValue("\(Int(rgbSize.height))", forHTTPHeaderField: "X-RgbH")
+                dreq.httpBody = dp.body
+                URLSession.shared.dataTask(with: dreq).resume()    // no reply needed
+            }
             URLSession.shared.dataTask(with: request) { data, _, _ in
                 var cmd: [String: Any]? = nil
                 if let data = data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -475,6 +435,28 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
                 }
             }.resume()
         }
+    }
+
+    /// Depth (float32 metres, w*h) followed by confidence (uint8, w*h), padding stripped; nil if this frame has no depth.
+    func packDepth(_ frame: ARFrame) -> (body: Data, w: Int, h: Int)? {
+        guard let sd = frame.sceneDepth else { return nil }
+        let d = sd.depthMap
+        CVPixelBufferLockBaseAddress(d, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(d, .readOnly) }
+        let w = CVPixelBufferGetWidth(d), h = CVPixelBufferGetHeight(d)
+        guard let dBase = CVPixelBufferGetBaseAddress(d) else { return nil }
+        let dStride = CVPixelBufferGetBytesPerRow(d)
+        var body = Data(capacity: w * h * 5)
+        for row in 0..<h { body.append(Data(bytes: dBase + row * dStride, count: w * 4)) }
+        if let c = sd.confidenceMap {
+            CVPixelBufferLockBaseAddress(c, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(c, .readOnly) }
+            if let cBase = CVPixelBufferGetBaseAddress(c), CVPixelBufferGetWidth(c) == w, CVPixelBufferGetHeight(c) == h {
+                let cStride = CVPixelBufferGetBytesPerRow(c)
+                for row in 0..<h { body.append(Data(bytes: cBase + row * cStride, count: w)) }
+            } else { body.append(Data(repeating: 2, count: w * h)) }
+        } else { body.append(Data(repeating: 2, count: w * h)) }
+        return (body, w, h)
     }
 
     // MARK: - Upload
