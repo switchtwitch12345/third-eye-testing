@@ -45,11 +45,11 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 _lock = threading.Lock()
 _state = {
     "jpeg": None, "markers": [], "preview_t": 0.0, "capturing": False, "saved": 0,
-    "tracking": "?", "marks": 0, "want": None, "mark_seq": 0, "files": 0,
-    "android_jpeg": None, "android_raw": None, "android_markers": [], "android_t": 0.0,
+    "tracking": "?", "marks": 0, "want": None, "mark_seq": 0, "files": 0, "want_mesh": False, "mesh_files": 0,
+    "android_jpeg": None, "android_raw": None, "jpeg_raw": None, "android_markers": [], "android_t": 0.0,
     "android_saved": 0, "android_size": None,
     "tower": {"layers": 10, "removed": []}, "overlay": None, "android_overlay": None,
-    "tower_epoch": 0, "tracker_msg": "tracker idle - press START", "tracker_on": False,
+    "autotower": {"status": "waiting for both cameras"}, "marks_log": [], "last_label": None, "label_stats": {"moves": 0, "wrong": 0}, "autotower_lock": True, "autotower_last": "none yet", "autotower_redetect": False, "tower_epoch": 0, "tracker_msg": "tracker idle - press START", "tracker_on": False,
     "dataset": {"on": False, "name": None, "frames": 0, "crops": 0, "total_crops": 0, "total_frames": 0}, "started": time.time(), "image_size": None,
 }
 _preview_times = collections.deque(maxlen=40)
@@ -94,6 +94,12 @@ font-size:14px;cursor:pointer;margin-top:14px;width:100%}
   <button id="bMark" style="background:#5a3a08;border-color:#8a5a12">MARK move done &nbsp;(Space)</button>
   <button id="bStop">STOP recording</button>
   <div class="hint" style="margin-bottom:10px">Control everything from here. Don't touch the phone.</div>
+  <h1 style="margin-top:6px;color:#ffb020">After MARK: which block did you pull?</h1>
+  <div class="hint" style="margin-top:0">After MARK, type <b>left</b>, <b>middle</b> or <b>right</b> (as in the iPhone picture), then Enter.
+  Add a number to say the layer yourself, e.g. <b>middle 5</b>. The face model finds the layer. Needs data capture ON.</div>
+  <input id="lbl" placeholder="left / middle / right  [layer]" autocomplete="off"
+    style="width:100%;margin-top:8px;background:#22262d;color:#e8eaed;border:1px solid #333944;border-radius:8px;padding:10px;font-size:15px">
+  <div id="lres" class="chip idle" style="font-size:14px;margin-top:8px">no label yet</div>
   <div class="row"><span>Frames saved</span><span class="big" id="saved">0</span></div>
   <div class="row"><span>Moves marked</span><span class="big" id="marks">0</span></div>
   <h1 style="margin-top:22px">Setup</h1>
@@ -102,6 +108,9 @@ font-size:14px;cursor:pointer;margin-top:14px;width:100%}
   <div class="row"><span>Phone tracking</span><span id="trk">–</span></div>
   <h1 style="margin-top:22px">Camera 2 (Android browser)</h1>
   <div id="amk" class="chip idle">not connected</div>
+  <h1 style="margin-top:22px">ARKit mesh test</h1>
+  <button id="bMesh" style="background:#2a2a45;border-color:#4a4a80">Turn ARKit mesh ON</button>
+  <div id="minfo" class="hint">off. Exports ARKit's own fused mesh about once a second while recording, to measure how fine it is.</div>
   <h1 style="margin-top:22px">Training data</h1>
   <button id="bData" style="background:#16324a;border-color:#2b5f8a">Start data capture</button>
   <div id="dinfo" class="hint">off. Records both cameras and cuts out every block face. Play normally;
@@ -113,6 +122,10 @@ font-size:14px;cursor:pointer;margin-top:14px;width:100%}
     style="width:150px;background:#22262d;color:#e8eaed;border:1px solid #333944;border-radius:6px;padding:4px"></div>
   <button id="tapply">Apply</button>
   <div id="tcount" class="hint">–</div>
+  <div id="tauto" class="hint">auto-detect: waiting…</div>
+  <button id="bRedetect">Re-detect tower (after rebuilding)</button>
+  <button id="bCover" style="background:#16324a;border-color:#2b5f8a">Check coverage (which blocks can I judge?)</button>
+  <pre id="cover" style="display:none;font-size:11px;line-height:1.35;background:#0e1013;border:1px solid #262a31;border-radius:8px;padding:8px;overflow:auto;white-space:pre"></pre>
   <div id="tmsg" class="chip idle" style="font-size:14px;margin-top:8px">tracker idle</div>
   <div class="hint">L = layer from the bottom (1 = bottom), S = slot 0, 1 or 2. Green = can be pulled.</div>
   <h1 style="margin-top:22px">Link</h1>
@@ -144,16 +157,23 @@ feed(c,'/preview.jpg','a',40);
 feed(c2,'/android.jpg','b',120);
 document.getElementById('rot').onclick=()=>rotate('a');
 document.getElementById('rotb').onclick=()=>rotate('b');
-addEventListener('keydown',e=>{if(e.key==='r'||e.key==='R')rotate('a');
+document.getElementById('lbl').addEventListener('keydown',e=>{if(e.key==='Enter'){
+  const v=e.target.value.trim(); if(v){fetch('/cmd/label',{method:'POST',body:JSON.stringify({text:v})}); e.target.value='';}}});
+addEventListener('keydown',e=>{ if(e.target&&e.target.tagName==='INPUT') return;
+  if(e.key==='r'||e.key==='R')rotate('a');
   if(e.key==='t'||e.key==='T')rotate('b');
   if(e.code==='Space'){e.preventDefault();cmd('mark')}});
-function cmd(n){fetch('/cmd/'+n,{method:'POST'})}
+function cmd(n){fetch('/cmd/'+n,{method:'POST'}); if(n==='mark'){setTimeout(()=>document.getElementById('lbl').focus(),150)}}
 document.getElementById('tapply').onclick=()=>{
   const rem=[...document.getElementById('tr').value.matchAll(/L\s*(\d+)\s*S\s*(\d)/gi)].map(m=>[+m[1]-1,+m[2]]);
   fetch('/cmd/tower',{method:'POST',body:JSON.stringify({layers:+document.getElementById('tl').value,removed:rem})});
 };
 let dataOn=false;
+document.getElementById('bCover').onclick=async()=>{const p=document.getElementById('cover');p.style.display='block';p.textContent='measuring...';p.textContent=await (await fetch('/coverage.txt')).text();};
+document.getElementById('bRedetect').onclick=()=>fetch('/cmd/redetect',{method:'POST'});
 document.getElementById('bData').onclick=()=>fetch('/cmd/dataset/'+(dataOn?'off':'on'),{method:'POST'});
+let meshOn=false;
+document.getElementById('bMesh').onclick=()=>fetch('/cmd/mesh/'+(meshOn?'off':'on'),{method:'POST'});
 document.getElementById('bStart').onclick=()=>cmd('start');
 document.getElementById('bStop').onclick=()=>cmd('stop');
 document.getElementById('bMark').onclick=()=>cmd('mark');
@@ -187,12 +207,20 @@ async function poll(){
     tag($('lbA'),live,s.markers);
     tag($('lbB'),s.android_age!==null&&s.android_age<10,s.android_markers);
     $('trk').textContent=s.tracking;
+    meshOn=!!s.want_mesh; const mb=$('bMesh');
+    mb.textContent=meshOn?'Turn ARKit mesh OFF':'Turn ARKit mesh ON';
+    $('minfo').textContent=meshOn?('ON · mesh files received: '+s.mesh_files):'off · exports ARKit\'s fused mesh ~1/s while recording';
     const ds=s.dataset||{}; dataOn=!!ds.on;
     const db=$('bData'); db.textContent=dataOn?'■ Stop data capture':'Start data capture';
     db.style.background=dataOn?'#5a1a16':'#16324a';
     $('dinfo').textContent=dataOn?('RECORDING DATA · this run: '+ds.frames+' frames, '+ds.crops+' crops · all runs: '+(ds.total_crops||0)+' crops')
       :('off · '+(ds.total_crops||0)+' crops saved so far');
+    const ll=s.last_label, st=s.label_stats||{}, lr=$('lres');
+    if(ll){ lr.textContent=(ll.message||ll.status)+(st.moves?('   ['+(st.moves-st.wrong)+'/'+st.moves+' right so far; no correction counts as right]'):'');
+      lr.className='chip '+(ll.status==='error'?'bad':ll.status==='done'?(ll.confident?'ok':'warn'):'idle'); }
+    else if(s.marks_pending){ lr.textContent='move marked: type left / middle / right'; lr.className='chip warn'; }
     const ov=s.overlay||s.android_overlay;
+    const au=s.autotower||{}; $('tauto').textContent='auto-detect: '+(au.status||'–')+(au.note?(' · '+au.note):'');
     const tm=$('tmsg'); tm.textContent=s.tracker_msg;
     tm.className='chip '+(s.tracker_msg.indexOf('could not')>=0||s.tracker_msg.indexOf('error')>=0||s.tracker_msg.indexOf('COLLAPSED')>=0?'bad':s.tracker_msg.indexOf('ready')===0||s.tracker_msg.indexOf('move')===0?'ok':'idle');
     $('tcount').textContent=ov?('green '+ov.green+'  ·  red '+ov.red):'overlay needs 2+ markers in view';
@@ -351,17 +379,30 @@ def _ruler(img, K, R, t, cam, layers):
         cv2.putText(img, text, (10, h - 10 - 22 * (len(lines) - 1 - i)), F, 0.5, col, 1, cv2.LINE_AA)
 
 
-def _draw_overlay(img, K, dist, dets, tower):
+_last_pose = {}      # kind -> (R, t, time): a phone on a stand does not move in a second
+
+
+def _draw_overlay(img, K, dist, dets, tower, kind=None):
     """Pose from the markers in this very frame, then every block in red or green."""
-    if not (HAVE_POSE and len(dets) >= 2):
+    if not HAVE_POSE:
         return None
-    d = {i: c for i, c in dets.items()}
-    if dist is not None and len(dist):
-        d = {i: cv2.undistortPoints(c.reshape(-1, 1, 2), K, dist, P=K).reshape(4, 2) for i, c in d.items()}
-    sol = _tp.solve(d, K, layout=_tp.LAYOUTS["A"])
-    if not sol or sol[2] > 8.0:
-        return None
-    R, t, _ = sol
+    sol = None
+    if len(dets) >= 3:
+        d = {i: c for i, c in dets.items()}
+        if dist is not None and len(dist):
+            d = {i: cv2.undistortPoints(c.reshape(-1, 1, 2), K, dist, P=K).reshape(4, 2) for i, c in d.items()}
+        sol = _tp.solve(d, K, layout=_tp.LAYOUTS["A"])
+        if sol and sol[2] > 10.0:
+            sol = None
+    if sol:
+        R, t, _ = sol
+        if kind:
+            _last_pose[kind] = (R, t, time.time())
+    else:                                  # a dropped marker for a moment: keep the last good pose briefly
+        held = _last_pose.get(kind)
+        if not held or time.time() - held[2] > 1.5:
+            return None
+        R, t, _ = held
     layers = int(tower["layers"])
     removed = {tuple(r) for r in tower["removed"]}
     ok = removable(layers, removed)
@@ -424,7 +465,7 @@ def _annotate(jpeg_bytes, kind=None):
             with _lock:
                 tower = dict(_state["tower"])
             try:
-                stats = _draw_overlay(img, K, dist, dets, tower)
+                stats = _draw_overlay(img, K, dist, dets, tower, kind)
             except Exception:
                 stats = None
         with _lock:
@@ -456,8 +497,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404)
             else:
                 self._send(200, jpeg, "image/jpeg")
+        elif path == "/coverage.txt":
+            try:
+                body = _coverage_text().encode()
+            except Exception as e:
+                body = f"error: {type(e).__name__}: {e}".encode()
+            self._send(200, body, "text/plain; charset=utf-8")
         elif path == "/cam":
             self._send(200, CAM_PAGE.encode(), "text/html; charset=utf-8")
+        elif path == "/preview_raw.jpg":
+            with _lock:
+                jpeg = _state["jpeg_raw"]
+            if jpeg is None:
+                self._send(404)
+            else:
+                self._send(200, jpeg, "image/jpeg")
         elif path in ("/android.jpg", "/android_raw.jpg"):
             with _lock:
                 jpeg = _state["android_jpeg" if path == "/android.jpg" else "android_raw"]
@@ -481,7 +535,8 @@ class Handler(BaseHTTPRequestHandler):
                 "upload_age": (now - last_up) if last_up else None,
                 "android_markers": s["android_markers"], "android_saved": s["android_saved"],
                 "android_age": (now - s["android_t"]) if s["android_t"] else None,
-                "android_size": s["android_size"], "android_dbg": list(_android_dbg)[-12:], "tower": s["tower"], "tracker_msg": s["tracker_msg"], "tracker_on": s["tracker_on"], "dataset": s["dataset"],
+                "android_size": s["android_size"], "android_dbg": list(_android_dbg)[-12:], "tower": s["tower"], "tracker_msg": s["tracker_msg"], "tracker_on": s["tracker_on"], "dataset": s["dataset"], "autotower": s["autotower"], "last_label": s["last_label"], "label_stats": s["label_stats"], "marks_pending": sum(1 for m in s["marks_log"] if not m["labelled"]),
+                "want_mesh": s["want_mesh"], "mesh_files": s["mesh_files"],
                 "overlay": s["overlay"], "android_overlay": s["android_overlay"],
             }).encode()
             self._send(200, body, "application/json")
@@ -503,6 +558,57 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(400, f"bad tower: {e}".encode())
             return
+        if self.path.startswith("/cmd/mesh/"):
+            with _lock:
+                _state["want_mesh"] = self.path.endswith("/on")
+            self._send(200, b"OK")
+            return
+        if self.path == "/cmd/label":
+            try:
+                import move_infer as mi
+                text = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}").get("text", "")
+                pos, layer = mi.parse_text(text)
+                with _lock:
+                    todo = [m for m in _state["marks_log"] if not m["labelled"]]
+                    last = _state["last_label"]
+                if pos is None and layer is not None and last and last.get("status") == "done":
+                    # a bare number corrects the previous answer
+                    with _lock:
+                        if layer != last.get("layer") and not last.get("corrected"):
+                            _state["label_stats"]["wrong"] += 1
+                        _state["last_label"] = dict(last, corrected=True, message=last["message"].split(". Wrong?")[0].split(". NOT CONFIDENT")[0]
+                                                    + f". Corrected by you to layer {layer}")
+                    try:
+                        ds = _state["dataset"].get("name")
+                        with open(os.path.join(HERE, "dataset", ds, "labels.jsonl"), "a") as f:
+                            f.write(json.dumps({"seq": last["seq"], "correction": layer, "time": time.strftime("%H:%M:%S")}) + "\n")
+                    except Exception:
+                        pass
+                    self._send(200, b"OK")
+                    return
+                if pos is None:
+                    with _lock:
+                        _state["last_label"] = {"status": "error", "message": "type left, middle or right (optionally plus the layer number)"}
+                    self._send(200, b"OK")
+                    return
+                if not todo:
+                    with _lock:
+                        _state["last_label"] = {"status": "error", "message": "press MARK first, then type"}
+                    self._send(200, b"OK")
+                    return
+                entry = todo[-1]
+                with _lock:
+                    entry["labelled"] = True
+                threading.Thread(target=_label_job, args=(entry, pos, layer), daemon=True).start()
+                self._send(200, b"OK")
+            except Exception as e:
+                self._send(400, f"bad label: {e}".encode())
+            return
+        if self.path == "/cmd/redetect":
+            with _lock:
+                _state["autotower_redetect"] = True
+            self._send(200, b"OK")
+            return
         if self.path.startswith("/cmd/dataset/"):
             on = self.path.endswith("/on")
             with _lock:
@@ -519,6 +625,7 @@ class Handler(BaseHTTPRequestHandler):
                     _state["want"] = False
                 elif cmd == "mark":
                     _state["mark_seq"] += 1
+                    _state["marks_log"].append({"seq": _state["mark_seq"], "t_ms": int(time.time() * 1000), "labelled": False})
                 else:
                     self._send(404, b"unknown command")
                     return
@@ -571,7 +678,7 @@ class Handler(BaseHTTPRequestHandler):
                 jpeg, ids = _annotate(raw, "iphone")
                 with _lock:
                     _state.update(
-                        jpeg=jpeg, markers=ids, preview_t=time.time(),
+                        jpeg=jpeg, jpeg_raw=raw, markers=ids, preview_t=time.time(),
                         capturing=self.headers.get("X-Capturing") == "1",
                         saved=int(self.headers.get("X-Saved", 0) or 0),
                         tracking=self.headers.get("X-Tracking", "?"),
@@ -579,7 +686,7 @@ class Handler(BaseHTTPRequestHandler):
                     _preview_times.append(time.time())
                     if _state["want"] is not None and _state["capturing"] == _state["want"]:
                         _state["want"] = None
-                    reply = {"capture": _state["want"], "mark_seq": _state["mark_seq"]}
+                    reply = {"capture": _state["want"], "mark_seq": _state["mark_seq"], "mesh": _state["want_mesh"]}
                 self._send(200, json.dumps(reply).encode(), "application/json")
             except Exception as e:
                 self._send(500, f"preview error: {e}".encode())
@@ -607,6 +714,8 @@ class Handler(BaseHTTPRequestHandler):
                             f.write(file_data)
                         with _lock:
                             _state["files"] += 1
+                            if filename.endswith("_mesh.bin"):
+                                _state["mesh_files"] += 1
                             _upload_times.append(time.time())
                         print(f"✅ Saved: {filename} ({len(file_data):,} bytes)")
                     except Exception as e:
@@ -730,7 +839,7 @@ def _dataset_loop():
                 on = _state["dataset"]["on"]
             if on and writer is None:
                 name = time.strftime("live_%Y%m%d_%H%M%S")
-                writer = fc.DatasetWriter(SAVE_DIR, os.path.join(HERE, "dataset", name), stride=2)
+                writer = fc.DatasetWriter(SAVE_DIR, os.path.join(HERE, "dataset", name), stride=1)   # every frame: more clean reference crops
                 writer.skip_existing()
                 started_marks = set(_g.glob(f"{SAVE_DIR}/*_mark.json"))
                 with _lock:
@@ -754,6 +863,174 @@ def _dataset_loop():
         except Exception as e:
             with _lock:
                 _state["dataset"]["error"] = f"{type(e).__name__}: {e}"
+
+
+# --- automatic tower setup: layer count + which way the blocks run, from the two cameras ----------------
+def _autotower_loop():
+    """Runs only when the Re-detect button is pressed: a short burst of frames from both cameras, averaged."""
+    try:
+        import tower_auto as ta
+    except Exception as e:
+        with _lock:
+            _state["autotower"] = {"status": f"unavailable: {e}"}
+        return
+
+    def grab():
+        with _lock:
+            ip, an = _state["jpeg_raw"], _state["android_raw"]
+            fresh_i = time.time() - _state["preview_t"] < 4
+            fresh_a = _state["android_t"] and time.time() - _state["android_t"] < 4
+        dec = lambda b: cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR) if b else None
+        return {"iphone": dec(ip) if fresh_i else None, "android": dec(an) if fresh_a else None}
+
+    def say(text, **extra):
+        with _lock:
+            _state["autotower"] = dict({"status": text}, **extra)
+
+    while True:
+        time.sleep(0.4)
+        try:
+            with _lock:
+                go = _state["autotower_redetect"]
+                busy = bool(_state["capturing"]) or _state["dataset"]["on"]
+            if not go:
+                continue
+            with _lock:
+                _state["autotower_redetect"] = False
+            if busy:
+                say("not while a game is being recorded")
+                continue
+            final, t_start = None, time.time()
+            for attempt in range(1, 4):
+                say(f"measuring (attempt {attempt}/3, keep both phones still)...")
+                r = ta.analyse_burst(grab, n=8, interval=0.3)
+                if not r["ok"]:
+                    say(f"attempt {attempt}/3 failed: {r['reason']}")
+                    time.sleep(1.0)
+                    continue
+                L, axis, ratio = r["layers"], r["axis"], r["ratio"]
+                expect_x = ((L - 1) % 2 == 0)
+                if (axis == "x") != expect_x:
+                    if ratio < 2.0:
+                        say(f"{L} layers, but not sure which way the top blocks run (evidence x{ratio:.1f}). "
+                            "Is the top layer complete?")
+                        continue
+                    k0 = _tp.TOWER_ROT
+                    _tp.set_tower_rotation(min(((k0 + 1) % 4, (k0 - 1) % 4), key=lambda k: min(k, 4 - k)))
+                    _last_pose.clear()
+                    time.sleep(1.0)
+                    continue                         # the frame changed: measure again to confirm
+                final = (L, axis, r)
+                break
+            if final:
+                L, axis, r = final
+                with _lock:
+                    _state["tower"] = {"layers": L, "removed": []}
+                    _state["tower_epoch"] += 1
+                    _state["autotower_lock"] = True
+                    _state["autotower_last"] = f"{L} layers, top blocks along {axis}"
+                say(f"done in {time.time() - t_start:.0f} s: {L} layers, top blocks along {axis}. Locked until you press Re-detect",
+                    layers=L, axis=axis, z=r["z"], ncc=r["ncc"], cams=r["cams"])
+        except Exception as e:
+            say(f"error: {type(e).__name__}: {e}")
+
+
+# --- "which layer?": the player types left / middle / right after a MARK, the face crops find the layer ----
+def _label_job(entry, pos, user_layer):
+    """Wait for the 'after' pictures, then find which layer's block in that column changed most."""
+    import move_infer as mi
+    def say(**kw):
+        with _lock:
+            _state["last_label"] = dict(seq=entry["seq"], pos=pos, **kw)
+    try:
+        wait = entry["t_ms"] / 1000.0 + 5.2 - time.time()
+        say(status="waiting for the after-pictures...")
+        if wait > 0:
+            time.sleep(wait)
+        with _lock:
+            ds = dict(_state["dataset"]); layers = int(_state["tower"]["layers"])
+            prev = [m for m in _state["marks_log"] if m["seq"] < entry["seq"]]
+        if not ds.get("name"):
+            return say(status="error", message="data capture was not on, so there are no face crops to look at")
+        run_dir = os.path.join(HERE, "dataset", ds["name"])
+        held = _last_pose.get("iphone")
+        if not held:
+            return say(status="error", message="the iPhone has not found the markers, so I can't map left/middle/right")
+        K = _k_iphone(960)[0]
+        slots = mi.slots_for_positions(held[0], held[1], K, layers)
+        with open(os.path.join(run_dir, "index.jsonl")) as f:
+            start_ms = json.loads(f.readline())["ts_ms"]
+        gone = mi.already_removed(run_dir, entry["seq"])
+        cands = [l for l in range(max(2, layers - 1)) if (pos, l) not in gone]     # nothing is ever put back
+        r = mi.infer(run_dir, entry["t_ms"], prev[-1]["t_ms"] if prev else None, start_ms, pos, slots, cands)
+        rec = {"seq": entry["seq"], "mark_ms": entry["t_ms"], "pos": pos, "user_layer": user_layer,
+               "time": time.strftime("%H:%M:%S"), "result": r}
+        if not r["ok"]:
+            say(status="error", message=r["reason"])
+        else:
+            agree = (user_layer == r["layer"]) if user_layer else None
+            with _lock:
+                _state["label_stats"]["moves"] += 1
+                if user_layer and not agree:
+                    _state["label_stats"]["wrong"] += 1
+            msg = f"{pos} column -> layer {r['layer']} (score {r['z']:.1f}, next best layer {r['runner_up']} at {r['runner_up_z']:.1f})"
+            if r.get("suspicious"):
+                msg += ". Unusually large: a hand or shadow may be over that face"
+            elif not r["confident"]:
+                msg += ". NOT CONFIDENT: please check, and type the real layer if it is wrong"
+            if user_layer:
+                msg += f". You said layer {user_layer}: {'MATCH' if agree else 'different'}"
+            else:
+                msg += ". Wrong? type the real layer number and press Enter"
+            say(status="done", message=msg, layer=r["layer"], confident=r["confident"], top=r["top"])
+        with open(os.path.join(run_dir, "labels.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        say(status="error", message=f"{type(e).__name__}: {e}")
+
+
+def _coverage_text():
+    """Which blocks can the two phones, where they stand right now, actually judge?  One cell per block."""
+    import face_crops as fc, move_infer as mi
+    with _lock:
+        layers = int(_state["tower"]["layers"])
+    poses = {n: _last_pose.get(n) for n in ("iphone", "android")}
+    if not poses["iphone"]:
+        return "the iPhone has not found the markers yet, so I can't tell (needs 3+ markers)"
+    K = _k_iphone(960)[0]
+    slots = mi.slots_for_positions(poses["iphone"][0], poses["iphone"][1], K, layers)
+    def cos_of(pose, g):
+        corners, c, n = g
+        cam = -pose[0].T @ pose[1]
+        to = cam - c
+        return float(n @ to) / (np.linalg.norm(to) + 1e-9)
+    lines = ["          left  middle  right      (best view of that block: # good  + ok  . poor  - blind)"]
+    weak = []
+    for layer in range(layers - 1, -1, -1):
+        cells = []
+        for pos in ("left", "middle", "right"):
+            slot = slots[layer][pos]
+            best, who = 0.0, ""
+            for name, pose in poses.items():
+                if not pose:
+                    continue
+                for sign in (1, -1):
+                    c = cos_of(pose, fc.face_geometry(layer, slot, sign))
+                    if c > best: best, who = c, name[0]
+                if slot in (0, 2):
+                    g = fc.side_geometry(layer, slot, -1 if slot == 0 else 1)
+                    if g is not None:
+                        c = cos_of(pose, g)
+                        if c > best: best, who = c, name[0]
+            sym = "#" if best >= 0.45 else "+" if best >= 0.30 else "." if best >= 0.15 else "-"
+            cells.append(f"{sym} {best:.2f}{who}")
+            if best < 0.30:
+                weak.append(f"L{layer + 1} {pos}")
+        lines.append(f"  layer {layer + 1:2d}  " + "   ".join(cells) + ("   <- pulled blocks here are hard to see" if layer < layers - 1 and any(c[0] in ".-" for c in cells) else ""))
+    lines.append("")
+    lines.append("letters: i = iPhone sees it best, a = Android.  Layer " + str(layers) + " (top) can't be pulled anyway.")
+    lines.append(f"{len(weak)} blocks are hard to judge from here: " + (", ".join(weak[:14]) + (" ..." if len(weak) > 14 else "") if weak else "none"))
+    return "\n".join(lines)
 
 
 class TLSThreadingServer(ThreadingHTTPServer):
@@ -814,6 +1091,7 @@ if __name__ == "__main__":
         if HAVE_POSE and HAVE_CV:
             threading.Thread(target=_tracker_loop, daemon=True).start()
             threading.Thread(target=_dataset_loop, daemon=True).start()
+            threading.Thread(target=_autotower_loop, daemon=True).start()
             print("🧱 Live tower tracker on: START, keep hands out 5 s, then MARK after each move")
         HPORT = int(os.environ.get("LIDAR_HTTPS_PORT", 8443))
         try:

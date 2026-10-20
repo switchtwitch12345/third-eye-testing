@@ -27,6 +27,8 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     var markButton: UIButton!
     var markCount = 0
     var lastMarkSeq: Int? = nil
+    var meshTest = false
+    var lastMeshExport = Date.distantPast
     var ipAddressField: UITextField!
     let saveQueue = DispatchQueue(label: "com.lidarcapture.savequeue")
     let sessionID = UUID().uuidString  // new value each app launch — frames from different launches don't share a world origin
@@ -287,6 +289,10 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
             }
         }
         
+        if meshTest && Date().timeIntervalSince(lastMeshExport) > 1.0 {
+            lastMeshExport = Date()
+            exportMesh(frame)
+        }
         if totalFrames % 6 == 0 && !previewBusy {  // ~10 fps live view on the Mac, capturing or not
             sendPreview(frame)
         }
@@ -359,6 +365,10 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
 
     // MARK: - Remote control from the Mac viewer (so nobody has to touch the phone)
     func handleRemote(_ cmd: [String: Any]) {
+        if let m = cmd["mesh"] as? Bool, m != meshTest {
+            meshTest = m
+            applyMeshMode(m)
+        }
         if let want = cmd["capture"] as? Bool, want != isCapturing {
             toggleCapture()
         }
@@ -367,6 +377,57 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
                 if seq > last { markMove() }
             }
             lastMarkSeq = seq   // first reply only syncs the counter; it never fires a stale mark
+        }
+    }
+
+    // MARK: - ARKit mesh test (off by default; switched on from the Mac viewer)
+    func applyMeshMode(_ on: Bool) {
+        let config = ARWorldTrackingConfiguration()
+        config.frameSemantics = [.sceneDepth]
+        if on { config.sceneReconstruction = .mesh }
+        sceneView.session.run(config)          // no reset options: world tracking carries on
+        print(on ? "🧱 ARKit mesh ON (exporting ~1/s)" : "🧱 ARKit mesh OFF")
+    }
+
+    /// Binary dump of every nearby ARMeshAnchor in WORLD coordinates (metres):
+    ///   "MSH1" | u32 anchorCount | 16 x f32 camera transform (column-major)
+    ///   per anchor: u32 vertexCount | u32 faceCount | vertexCount x (f32 x,y,z) | faceCount x (u32 a,b,c)
+    func exportMesh(_ frame: ARFrame) {
+        let anchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
+        guard !anchors.isEmpty else { return }
+        let cam = frame.camera.transform
+        let camPos = SIMD3<Float>(cam.columns.3.x, cam.columns.3.y, cam.columns.3.z)
+        let ts = Int(Date().timeIntervalSince1970 * 1000)
+        saveQueue.async {
+            var data = Data()
+            func put<T>(_ v: T) { var x = v; withUnsafeBytes(of: &x) { data.append(contentsOf: $0) } }
+            let near = anchors.filter { a in
+                let p = SIMD3<Float>(a.transform.columns.3.x, a.transform.columns.3.y, a.transform.columns.3.z)
+                return simd_distance(p, camPos) < 2.5
+            }
+            data.append(contentsOf: Array("MSH1".utf8))
+            put(UInt32(near.count))
+            for i in 0..<4 { for j in 0..<4 { put(cam[i][j]) } }
+            for a in near {
+                let g = a.geometry
+                let vc = g.vertices.count, fc = g.faces.count
+                put(UInt32(vc)); put(UInt32(fc))
+                let vb = g.vertices.buffer.contents()
+                for v in 0..<vc {
+                    let p = vb.advanced(by: g.vertices.offset + g.vertices.stride * v).assumingMemoryBound(to: Float.self)
+                    let w = a.transform * SIMD4<Float>(p[0], p[1], p[2], 1)
+                    put(w.x); put(w.y); put(w.z)
+                }
+                let fb = g.faces.buffer.contents()
+                let bpi = g.faces.bytesPerIndex
+                for f in 0..<fc {
+                    for k in 0..<3 {
+                        let idx = fb.advanced(by: (f * 3 + k) * bpi).assumingMemoryBound(to: UInt32.self).pointee
+                        put(idx)
+                    }
+                }
+            }
+            self.uploadFile(data: data, filename: "\(ts)_mesh.bin", type: "application/octet-stream")
         }
     }
 

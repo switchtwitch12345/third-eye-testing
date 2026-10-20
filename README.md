@@ -21,7 +21,7 @@ blocks are present, and shows **green / red** on each block: green = may be pull
 * iPhone with LiDAR (tested on a 15 Pro) running the app in `lidar-capture/` (Xcode, UIKit + ARKit)
 * Optional second camera: any phone with a browser (served over HTTPS by the Mac)
 * 4 printed ArUco markers (`aruco_markers_A4.png`: DICT_4X4_50, ids 0-3, **40 mm**), taped in a square ring
-  (ids run around the square, centres 182 mm apart), tower centred between them. Phones on stands, ~45 cm away.
+  (ids run around the square; set the half-spacing in `tower_points.py` / env `MARKER_HALF`, currently 80 mm = ~160 mm apart), tower centred between them. Phones on stands, ~45 cm away.
 
 ## Quick start
 ```bash
