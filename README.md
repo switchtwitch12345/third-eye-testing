@@ -44,8 +44,10 @@ scripts/setup.sh                      # venv + dependencies + fetches STEPWISE i
 1. Open `lidar-capture.xcodeproj` in Xcode, choose **your own signing team**, run on the iPhone, type the Mac's IP.
    (Rebuild after pulling updates: the app now also streams depth for the loose-block / game-over features.)
 2. Open `http://localhost:8000/` — live view and controls (START / STOP / MARK with the space bar).
-3. Second camera: open `https://<mac-ip>:8443/cam` in Chrome and accept the certificate warning (the server makes its own
-   certificate in `certs/`). Calibrate its lens once: `.venv/bin/python calibrate_camera.py --show-board`, then
+3. Android / second camera (Pixel): install the native app in `android-capture/` (see below), type the
+   computer's IP, and leave it running on its stand. (The old browser page `https://<mac-ip>:8443/cam` still works;
+   accept the certificate warning, the server makes its own certificate in `certs/`.)
+   Calibrate its lens once: `.venv/bin/python calibrate_camera.py --show-board`, then
    `.venv/bin/python calibrate_camera.py --url http://127.0.0.1:8000/android_raw.jpg`.
    The shipped `camera_android.json` is **for the author's phone** — replace it with your own calibration.
 4. Optional but recommended once per marker mat: `.venv/bin/python calibrate_markers.py` measures where your markers
@@ -77,11 +79,27 @@ scripts/setup.sh                      # venv + dependencies + fetches STEPWISE i
 ```
 `test_loose_replay.py` and `test_height_replay.py` replay recorded depth frames and need recordings that are not in this repo.
 
+## Android app (`android-capture/`)
+Kotlin port of the iPhone app for the Pixel, without LiDAR: it streams 1280×720 JPEGs at up to 60 fps over Wi-Fi to
+`POST /android` over plain HTTP (port 8000, no certificate warning; kept-alive sockets, frames encoded and sent four at a time, the
+server answers before running marker detection), shows the markers the server sees, and its
+START / STOP / MARK buttons go through `/cmd/…`, so they drive the iPhone recording just like the viewer buttons.
+The live view shows every frame; disk saves while recording stay at ~3 fps (`ANDROID_SAVE_FPS=10` for more).
+The server works on macOS, Linux or Windows; frames are saved to `iphone_saved/` next to the scripts
+(or `LIDAR_SAVE_DIR`).
+```bash
+cd android-capture && ./gradlew assembleDebug          # needs JDK 17+ and the Android SDK (or open in Android Studio)
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+The lens calibration in `camera_android.json` was made at 1280×720 through Chrome. If markers line up badly, run
+`calibrate_camera.py --url http://127.0.0.1:8000/android_raw.jpg` again while the app is streaming.
+
 ## Layout
 | File | Purpose |
 |---|---|
 | `iphone_saved.py` | Upload server + live viewer + overlay + data capture + layer-finder job + loose/game-over watch |
 | `lidar-capture/` | iOS app (capture, preview + depth stream, remote START/STOP/MARK) |
+| `android-capture/` | Android (Pixel) second-camera app, Kotlin + CameraX |
 | `jenga_rules.py`, `test_jenga_rules.py` | Red/green pull rules and their tests |
 | `move_infer.py`, `label_eval.py` | Which layer was pulled (before/after of a MARK) and scoring against `labels.jsonl` |
 | `tower_points.py` | Marker layout, pose solver (tries many starts when only 3 markers are visible), LiDAR-into-tower-frame |
@@ -126,8 +144,9 @@ Optional. The phones work over Wi-Fi exactly as before; with a cable the picture
 * **Android.** Nothing to relay: `adb reverse tcp:8000 tcp:8000` (what `scripts/wired.sh` does) makes the Mac's game
   server appear as `localhost:8000` on the phone, so the browser page `http://localhost:8000/cam` (or a native app that
   POSTs JPEG frames to `/android`) works with no network. Needs `brew install android-platform-tools` and USB debugging.
-  There is no native Android app in this repo yet: the camera is the `/cam` web page. A native app only has to POST each
-  frame to `http://localhost:8000/android` (body = JPEG, optional headers `X-Draw`, `X-Enc`, `X-Up`) after `adb reverse`.
+  The native app (`android-capture/`) checks `127.0.0.1:8000` once a second; while the game server answers there it sends
+  everything over the cable, the IP box turns green and the status says `🔌 USB`. Unplug (or no `adb reverse`) and it is
+  back on the typed Wi-Fi IP within 3 s. Re-run `scripts/wired.sh` after replugging: `adb reverse` does not survive it.
 
 ## Notes
 * Recordings and the dataset are deliberately not in this repo (large; they show people). `docs/` has tower-only figures.

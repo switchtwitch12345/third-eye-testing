@@ -167,6 +167,19 @@ def analyse_burst(grab, n=8, interval=0.3, layers_hint=None):
         time.sleep(interval)
     res = {"cams": sorted(best), "pairs": frames_used, "layers": None, "z": None, "ncc": None,
            "axis": None, "ratio": None, "ok": False, "reason": None}
+    if layers_hint:
+        # the height is already known (the iPhone's LiDAR): only which way the top blocks run is left
+        z_top = layers_hint * LAYER_MM
+        res["layers"], res["z"] = int(layers_hint), z_top
+        views = grab()
+        prep = {nm: (cv2.undistort(img, best[nm][1], camera_K(nm, img)[1]) if camera_K(nm, img)[1] is not None and len(camera_K(nm, img)[1]) else img,
+                     best[nm][1], best[nm][2], best[nm][3], best[nm][4])
+                for nm, img in views.items() if img is not None and nm in best}
+        res["axis"], res["ratio"] = direction(prep, z_top)
+        res["ok"] = res["axis"] is not None
+        if not res["ok"]:
+            res["reason"] = "no camera found 3+ markers"
+        return res
     if frames_used < 3:
         missing = [c for c in ("iphone", "android") if c not in best]
         res["reason"] = (f"{'+'.join(missing)} never found 3+ markers" if missing

@@ -32,7 +32,9 @@ except Exception:
     HAVE_CV = False
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SAVE_DIR = os.environ.get("LIDAR_SAVE_DIR", "/Users/mitul/Desktop/lidar-capture/iphone_saved")
+_OLD_MAC_DIR = "/Users/mitul/Desktop/lidar-capture/iphone_saved"   # kept so existing Mac setups don't move
+SAVE_DIR = os.environ.get("LIDAR_SAVE_DIR") or (
+    _OLD_MAC_DIR if os.path.isdir(_OLD_MAC_DIR) else os.path.join(HERE, "iphone_saved"))
 sys.path.insert(0, HERE)
 try:
     import tower_points as _tp          # marker layout + pose solver
@@ -43,19 +45,22 @@ except Exception:
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 _lock = threading.Lock()
+_new_frame = threading.Condition(_lock)   # notified when a camera frame lands, for the viewer's long-poll
 _state = {
     "jpeg": None, "markers": [], "preview_t": 0.0, "capturing": False, "saved": 0,
     "tracking": "?", "marks": 0, "want": None, "mark_seq": 0, "files": 0,
     "android_jpeg": None, "android_raw": None, "jpeg_raw": None, "android_markers": [], "android_t": 0.0,
-    "android_saved": 0, "android_size": None,
+    "android_saved": 0, "android_size": None, "preview_seq": 0, "android_seq": 0,
     "tower": {"layers": 10, "removed": []}, "loose": [], "loose_info": None, "game_over": None, "height_info": None, "tower_fit": None, "overlay": None, "android_overlay": None, "labels": {},
-    "autotower": {"status": "waiting for both cameras"}, "marks_log": [], "last_label": None, "label_stats": {"moves": 0, "wrong": 0}, "autotower_lock": True, "autotower_last": "none yet", "autotower_redetect": False, "tower_epoch": 0, "tracker_msg": "tracker idle - press START", "tracker_on": False,
+    "autotower": {"status": "waiting for both cameras"}, "marks_log": [], "last_label": None, "label_stats": {"moves": 0, "wrong": 0}, "autotower_lock": True, "autotower_last": "none yet", "autotower_redetect": False, "autotower_auto": True, "lidar_top": None, "depth_dbg": {"n": 0, "why": None}, "tower_epoch": 0, "tracker_msg": "tracker idle - press START", "tracker_on": False,
     "dataset": {"on": False, "name": None, "frames": 0, "crops": 0, "total_crops": 0, "total_frames": 0}, "started": time.time(), "image_size": None,
 }
 _preview_times = collections.deque(maxlen=40)
 _upload_times = collections.deque(maxlen=400)
 _android_times = collections.deque(maxlen=40)
 _android_dbg = collections.deque(maxlen=60)
+# The app streams much faster than the old ~3 fps; disk saves stay at about the old rate unless asked for more.
+ANDROID_SAVE_FPS = float(os.environ.get("ANDROID_SAVE_FPS", 3))
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>LiDAR live view</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -121,6 +126,7 @@ font-size:14px;cursor:pointer;margin-top:14px;width:100%}
   <div id="tcount" class="hint">–</div>
   <div id="tauto" class="hint">auto-detect: waiting…</div>
   <button id="bRedetect">Re-detect tower (after rebuilding)</button>
+  <button id="bAuto">Auto-detect: on</button>
   <button id="bCover" style="background:#16324a;border-color:#2b5f8a">Check coverage (which blocks can I judge?)</button>
   <pre id="cover" style="display:none;font-size:11px;line-height:1.35;background:#0e1013;border:1px solid #262a31;border-radius:8px;padding:8px;overflow:auto;white-space:pre"></pre>
   <div id="tmsg" class="chip idle" style="font-size:14px;margin-top:8px">tracker idle</div>
@@ -141,12 +147,13 @@ let LAB={};
 const LEG=[['white: layer, counted from the bottom','#fff'],['yellow digit: slot of layers 1,3,5,7,9','#ffd700'],['cyan digit: slot of layers 2,4,6,8,10','#00dcff']];
 function drawTo(cv,img,rot,lab){
   const x=cv.getContext('2d');
-  const sw=rot%180? img.naturalHeight:img.naturalWidth, sh=rot%180? img.naturalWidth:img.naturalHeight;
+  const iw=img.naturalWidth||img.width, ih=img.naturalHeight||img.height;
+  const sw=rot%180? ih:iw, sh=rot%180? iw:ih;
   if(cv.width!==sw||cv.height!==sh){cv.width=sw;cv.height=sh}
   x.save();x.translate(cv.width/2,cv.height/2);x.rotate(rot*Math.PI/180);
-  x.drawImage(img,-img.naturalWidth/2,-img.naturalHeight/2);x.restore();
-  const k=img.naturalWidth/960, a=rot*Math.PI/180, co=Math.cos(a), si=Math.sin(a);
-  if(lab&&lab.w===img.naturalWidth&&lab.h===img.naturalHeight){   // labels are drawn upright, at the turned positions
+  x.drawImage(img,-iw/2,-ih/2);x.restore();
+  const k=iw/960, a=rot*Math.PI/180, co=Math.cos(a), si=Math.sin(a);
+  if(lab&&lab.w===iw&&lab.h===ih){   // labels are drawn upright, at the turned positions
     for(const [t,px,py,sc,col] of lab.items){
       const dx=px-lab.w/2, dy=py-lab.h/2, X=cv.width/2+dx*co-dy*si, Y=cv.height/2+dx*si+dy*co;
       x.font='bold '+Math.round(sc*34*k)+'px sans-serif'; x.lineWidth=4*k; x.strokeStyle='#000'; x.strokeText(t,X,Y);
@@ -157,14 +164,26 @@ function drawTo(cv,img,rot,lab){
   x.fillStyle='#000'; x.fillRect(4*k,cv.height-4*k-lh*3-6*k,330*k,lh*3+6*k);
   LEG.forEach(([t,col],i)=>{x.fillStyle=col;x.fillText(t,10*k,cv.height-10*k-lh*(2-i))});
 }
-function feed(cv,url,which,gap){
-  const im=new Image();
-  im.onload=()=>{drawTo(cv,im,rots[which],which==='a'?LAB.iphone:LAB.android);setTimeout(()=>feed(cv,url,which,gap),gap)};
-  im.onerror=()=>setTimeout(()=>feed(cv,url,which,gap),600);
-  im.src=url+'?'+Date.now();
+// Long-poll: the server holds the request until a frame newer than `after` exists, so the view
+// runs at whatever rate the phone sends, without re-fetching the same frame.
+const shown={a:[],b:[]};   // when each camera's frames were drawn here, to compare with what the server receives
+function shownFps(w){const t=shown[w],now=performance.now();while(t.length&&t[0]<now-2000)t.shift();
+  return t.length<2?0:(t.length-1)*1000/(t[t.length-1]-t[0])}
+async function feed(cv,url,which){
+  let after=0;
+  for(;;){
+    try{
+      const r=await fetch(url+'?after='+after);
+      if(r.status===204) continue;
+      if(!r.ok) throw 0;
+      after=+(r.headers.get('X-Seq')||0);
+      const bmp=await createImageBitmap(await r.blob());
+      drawTo(cv,bmp,rots[which],which==='a'?LAB.iphone:LAB.android); bmp.close(); shown[which].push(performance.now());
+    }catch(e){await new Promise(f=>setTimeout(f,600))}
+  }
 }
-feed(c,'/preview.jpg','a',40);
-feed(c2,'/android.jpg','b',120);
+feed(c,'/preview.jpg','a');
+feed(c2,'/android.jpg','b');
 document.getElementById('rot').onclick=()=>rotate('a');
 document.getElementById('rotb').onclick=()=>rotate('b');
 document.getElementById('lbl').addEventListener('keydown',e=>{if(e.key==='Enter'){
@@ -181,6 +200,8 @@ document.getElementById('tapply').onclick=()=>{
 let dataOn=false;
 document.getElementById('bCover').onclick=async()=>{const p=document.getElementById('cover');p.style.display='block';p.textContent='measuring...';p.textContent=await (await fetch('/coverage.txt')).text();};
 document.getElementById('bRedetect').onclick=()=>fetch('/cmd/redetect',{method:'POST'});
+let autoOn=true;
+document.getElementById('bAuto').onclick=()=>fetch('/cmd/autotower/'+(autoOn?'off':'on'),{method:'POST'});
 document.getElementById('bData').onclick=()=>fetch('/cmd/dataset/'+(dataOn?'off':'on'),{method:'POST'});
 document.getElementById('bStart').onclick=()=>cmd('start');
 document.getElementById('bStop').onclick=()=>cmd('stop');
@@ -207,7 +228,7 @@ async function poll(){
     if(s.android_age!==null&&s.android_age<10){
       const n=s.android_markers.length;
       a.className='chip '+(n>=3?'ok':n===2?'warn':'bad');
-      a.textContent='markers '+(s.android_markers.join(', ')||'none')+'  ·  saved '+s.android_saved;
+      a.textContent='markers '+(s.android_markers.join(', ')||'none')+'  ·  '+s.android_fps.toFixed(1)+' fps (shown '+shownFps('b').toFixed(0)+')  ·  saved '+s.android_saved;
     }else{a.className='chip idle';a.textContent='not connected';}
     const tag=(el,ok,ids)=>{ if(!ok){el.className='tag';el.textContent='no signal';return}
       el.className='tag '+(ids.length>=3?'ok':ids.length===2?'warn':'bad');
@@ -229,11 +250,12 @@ async function poll(){
       lr.className='chip '+(ll.status==='error'?'bad':ll.status==='done'?(ll.confident?'ok':'warn'):'idle'); }
     else if(s.marks_pending){ lr.textContent='move marked: type left / middle / right'; lr.className='chip warn'; }
     const ov=s.overlay||s.android_overlay;
+    autoOn=!!s.autotower_auto; $('bAuto').textContent='Auto-detect: '+(autoOn?'on':'off');
     const au=s.autotower||{}; $('tauto').textContent='auto-detect: '+(au.status||'–')+(au.note?(' · '+au.note):'');
     const tm=$('tmsg'); tm.textContent=s.tracker_msg;
     tm.className='chip '+(s.tracker_msg.indexOf('could not')>=0||s.tracker_msg.indexOf('error')>=0||s.tracker_msg.indexOf('COLLAPSED')>=0?'bad':s.tracker_msg.indexOf('ready')===0||s.tracker_msg.indexOf('move')===0?'ok':'idle');
     $('tcount').textContent=ov?('green '+ov.green+(ov.amber?'  ·  amber (loose) '+ov.amber:'')+'  ·  red '+ov.red)+(s.height_info?('  ·  LiDAR height ≈ '+s.height_info.lidar_layers+' layers'):''):'overlay needs 2+ markers in view';
-    $('pfps').textContent=live?s.preview_fps.toFixed(1)+' fps':'–';
+    $('pfps').textContent=live?s.preview_fps.toFixed(1)+' fps (shown '+shownFps('a').toFixed(0)+')':'–';
     $('ups').textContent=s.upload_rate.toFixed(1)+' files/s  ('+s.files+' total)';
     $('age').textContent=s.upload_age===null?'–':s.upload_age.toFixed(1)+' s ago';
   }catch(e){}
@@ -389,6 +411,22 @@ def _no_moves(tower):
     return bool(ok) and not any(ok.values())
 
 
+MIN_MARKER_PX = 28.0   # mean marker side below this: the pose is too shaky to draw a tall tower from
+
+
+def _marker_px(dets):
+    return float(np.mean([np.linalg.norm(q[k] - q[(k + 1) % 4]) for q in dets.values() for k in range(4)]))
+
+
+def _hint(img, text):
+    h, w = img.shape[:2]
+    scale = max(0.5, w / 1600)
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+    x, y = (w - tw) // 2, int(h * 0.08) + th
+    cv2.rectangle(img, (x - 10, y - th - 10), (x + tw + 10, y + 10), (0, 0, 0), -1)
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 176, 255), 2, cv2.LINE_AA)
+
+
 def _draw_overlay(img, K, dist, dets, tower, kind=None):
     """Pose from the markers in this very frame, then every block in red or green."""
     if not HAVE_POSE:
@@ -401,6 +439,12 @@ def _draw_overlay(img, K, dist, dets, tower, kind=None):
         sol = _tp.solve(d, K, layout=_tp.LAYOUTS["A"])
         if sol and sol[2] > 10.0:
             sol = None
+    if dets and _marker_px(dets) < MIN_MARKER_PX:
+        # markers this small give a pose that is off by centimetres 250 mm up: say so instead of drawing it
+        if kind:
+            _last_pose.pop(kind, None); _pose_lock.pop(kind, None)
+        _hint(img, "markers too small - move this phone closer to the board")
+        return None
     if sol:
         R, t, _ = sol
         if kind:
@@ -465,8 +509,8 @@ def _draw_overlay(img, K, dist, dets, tower, kind=None):
                 continue
             quad = uv[list(f)]
             cv2.fillConvexPoly(fill, quad, col)
-            cv2.polylines(img, [quad.reshape(-1, 1, 2)], True, col, 2, cv2.LINE_AA)
-    cv2.addWeighted(fill, 0.38, img, 0.62, 0, img)
+            cv2.polylines(img, [quad.reshape(-1, 1, 2)], True, col, 1, cv2.LINE_AA)
+    cv2.addWeighted(fill, 0.2, img, 0.8, 0, img)          # light tint, so the real blocks stay visible
     _ruler(img, K, R, t, cam, layers)
     n_amber = sum(1 for k, g in ok.items() if g and k in loose)
     return {"green": int(sum(ok.values())) - n_amber, "amber": n_amber, "red": int(len(ok) - sum(ok.values()))}
@@ -516,7 +560,15 @@ _loose_st = {"epoch": None, "layers": None, "base": {}, "hist": {}}
 
 
 DROP_MM = 20.0         # the top of the tower falling by more than a layer (15 mm) means pieces fell: pulls never lower it
-_height_st = {"epoch": None, "layers": None, "ref": [], "hist": []}
+_height_st = {"epoch": None, "layers": None, "ref": [], "hist": [], "live": []}
+
+
+def _depth_note(why):
+    with _lock:
+        d = _state["depth_dbg"]
+        d.update(n=d["n"] + 1, why=why, at=time.strftime("%H:%M:%S"))
+        if _state["lidar_top"]:
+            d["top_mm"] = round(_state["lidar_top"][0], 1)
 
 
 FIT_GAIN = 0.6              # how much of each fitted correction to take (smooths out noise, still settles in ~3 readings)
@@ -588,16 +640,22 @@ def _watch_height(P, epoch, layers, ready=True, h_obs=None):
         _height_st.update(epoch=epoch, layers=layers, ref=[], hist=[])
         with _lock:
             _state["game_over"] = None
+    if os.environ.get("DEPTH_DUMP"):
+        np.save(os.environ["DEPTH_DUMP"], P)
     if not ready:
-        return                                                # wait until the fit has settled: only then is the window on the tower
+        return _depth_note("waiting for the tower fit")   # only then is the window on the tower
     if h_obs is not None:
         top = h_obs                                           # the fitted top: robust, and independent of the marker pose
     else:                                                     # no usable fit (collapsed? hidden?): the small window as before
         core = (np.abs(P[:, 0]) < 30) & (np.abs(P[:, 1]) < 30) & (P[:, 2] > 20)
         z = P[core, 2]
         if len(z) < 60:
-            return
+            return _depth_note(f"only {len(z)} depth points over the tower core")
         top = float(np.percentile(z, 95))
+    _depth_note("ok")
+    _height_st["live"] = (_height_st["live"] + [top])[-7:]
+    with _lock:
+        _state["lidar_top"] = (float(np.median(_height_st["live"])), time.time())   # for the tower auto-detect
     if len(_height_st["ref"]) < 8:
         _height_st["ref"].append(top)                # the first readings of a new tower: its normal height
         return
@@ -620,14 +678,14 @@ def _process_depth(h, body):
     w, hh = int(h["X-W"]), int(h["X-H"])
     n = w * hh
     if len(body) < 5 * n:
-        return
+        return _depth_note("short depth frame")
     now = time.time()
     held = _last_pose.get("iphone")
     live = bool(held and now - held[2] <= 3.0)
     if "iphone" in _pose_lock and now - _lock_valid.get("iphone", 0) <= 6.0:
         R, t = _tp._corrected(*_pose_lock["iphone"])   # markers may be hidden (fallen blocks?), but the phone has not moved
     else:
-        return
+        return _depth_note("no iPhone pose")
     depth = np.frombuffer(body[:4 * n], np.float32).reshape(hh, w)
     conf = np.frombuffer(body[4 * n:5 * n], np.uint8).reshape(hh, w)
     K = np.array([[float(h["X-Fx"]), 0, float(h["X-Cx"])], [0, float(h["X-Fy"]), float(h["X-Cy"])], [0, 0, 1.0]])
@@ -676,7 +734,43 @@ def _process_depth(h, body):
                                 "most_out_mm": round(worst, 1), "at": time.strftime("%H:%M:%S")}
 
 
+class _LatestFrameWorker:
+    """Annotates the newest Android frame on its own thread; frames that arrive while it is busy are skipped."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._raw = None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def submit(self, raw):
+        with self._cv:
+            self._raw = raw
+            self._cv.notify()
+
+    def _run(self):
+        while True:
+            with self._cv:
+                self._cv.wait_for(lambda: self._raw is not None)
+                raw, self._raw = self._raw, None
+            try:
+                jpeg, ids = _annotate(raw, "android")
+            except Exception:
+                jpeg, ids = raw, []
+            with _lock:
+                _state.update(android_jpeg=jpeg, android_markers=ids)
+                _state["android_seq"] += 1
+                _new_frame.notify_all()
+
+
+_android_cv = _LatestFrameWorker()
+
+
 class Handler(BaseHTTPRequestHandler):
+    # Keep-alive: the Android app sends every frame over one connection instead of a new TCP handshake per
+    # frame (costly over Wi-Fi). Every response carries Content-Length, and every POST body is read.
+    protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True      # no ~40 ms Nagle / delayed-ACK stall per reply
+
     def _send(self, code, body=b"", ctype="text/plain", extra=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -684,8 +778,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(body)
+        self._headers_buffer += [b"\r\n", body]   # end_headers(), but headers + body go out in one write
+        self.flush_headers()
+
+    def _send_frame(self, key, seq_key):
+        """Latest frame; with ?after=N, wait (up to 2 s) for a frame newer than N first."""
+        m = re.search(r"[?&]after=(\d+)", self.path)
+        after = int(m.group(1)) if m else -1
+        with _new_frame:
+            _new_frame.wait_for(lambda: _state[seq_key] > after and _state[key] is not None, timeout=2.0)
+            jpeg, seq = _state[key], _state[seq_key]
+        if jpeg is None:
+            self._send(404)
+        elif seq <= after:
+            self._send(204)
+        else:
+            self._send(200, jpeg, "image/jpeg", {"X-Seq": str(seq)})
 
     # --- viewer -------------------------------------------------------------------------
     def do_GET(self):
@@ -693,12 +801,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
         elif path == "/preview.jpg":
-            with _lock:
-                jpeg = _state["jpeg"]
-            if jpeg is None:
-                self._send(404)
-            else:
-                self._send(200, jpeg, "image/jpeg")
+            self._send_frame("jpeg", "preview_seq")
         elif path == "/coverage.txt":
             try:
                 body = _coverage_text().encode()
@@ -715,12 +818,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(200, jpeg, "image/jpeg")
         elif path in ("/android.jpg", "/android_raw.jpg"):
-            with _lock:
-                jpeg = _state["android_jpeg" if path == "/android.jpg" else "android_raw"]
-            if jpeg is None:
-                self._send(404)
-            else:
-                self._send(200, jpeg, "image/jpeg")
+            self._send_frame("android_jpeg" if path == "/android.jpg" else "android_raw", "android_seq")
         elif path == "/status.json":
             now = time.time()
             with _lock:
@@ -728,16 +826,18 @@ class Handler(BaseHTTPRequestHandler):
                 ut = [t for t in _upload_times if now - t < 5.0]
                 s = dict(_state)
                 last_up = _upload_times[-1] if _upload_times else None
+                at = list(_android_times)
             fps = (len(pt) - 1) / (pt[-1] - pt[0]) if len(pt) > 2 and pt[-1] > pt[0] else 0.0
+            afps = (len(at) - 1) / (at[-1] - at[0]) if len(at) > 2 and at[-1] > at[0] and now - at[-1] < 2 else 0.0
             body = json.dumps({
                 "cv": HAVE_CV, "markers": s["markers"], "capturing": s["capturing"],
                 "saved": s["saved"], "marks": s["marks"], "want": s["want"], "tracking": s["tracking"], "files": s["files"],
                 "preview_age": (now - s["preview_t"]) if s["preview_t"] else None,
-                "preview_fps": fps, "upload_rate": len(ut) / 5.0,
+                "preview_fps": fps, "android_fps": afps, "upload_rate": len(ut) / 5.0,
                 "upload_age": (now - last_up) if last_up else None,
                 "android_markers": s["android_markers"], "android_saved": s["android_saved"],
                 "android_age": (now - s["android_t"]) if s["android_t"] else None,
-                "android_size": s["android_size"], "android_dbg": list(_android_dbg)[-12:], "tower": s["tower"], "tracker_msg": s["tracker_msg"], "tracker_on": s["tracker_on"], "dataset": s["dataset"], "autotower": s["autotower"], "last_label": s["last_label"], "label_stats": s["label_stats"], "marks_pending": sum(1 for m in s["marks_log"] if not m["labelled"]),
+                "android_size": s["android_size"], "android_dbg": list(_android_dbg)[-12:], "tower": s["tower"], "tracker_msg": s["tracker_msg"], "tracker_on": s["tracker_on"], "dataset": s["dataset"], "autotower": s["autotower"], "autotower_auto": s["autotower_auto"], "depth_dbg": dict(s["depth_dbg"]), "last_label": s["last_label"], "label_stats": s["label_stats"], "marks_pending": sum(1 for m in s["marks_log"] if not m["labelled"]),
                 "overlay": s["overlay"], "android_overlay": s["android_overlay"], "labels": s["labels"], "loose": s["loose"], "loose_info": s["loose_info"], "no_moves": _no_moves(s["tower"]), "tower_epoch": s["tower_epoch"], "game_over": s["game_over"], "height_info": s["height_info"], "tower_fit": s["tower_fit"],
             }).encode()
             self._send(200, body, "application/json")
@@ -746,6 +846,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- phone --------------------------------------------------------------------------
     def do_POST(self):
+        if self.path.startswith("/cmd/") and self.path != "/cmd/tower":
+            self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))   # keep the connection in sync
         if self.path == "/cmd/tower":
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
@@ -753,6 +855,8 @@ class Handler(BaseHTTPRequestHandler):
                 removed = [[int(a), int(b)] for a, b in body.get("removed", [])
                            if 0 <= int(a) < layers and 0 <= int(b) < 3]
                 with _lock:
+                    if layers != _state["tower"]["layers"]:
+                        _state["autotower_auto"] = False      # a typed layer count wins over the cameras
                     _state["tower"] = {"layers": layers, "removed": removed}
                     _state["tower_epoch"] += 1
                     _state["game_over"] = None
@@ -818,6 +922,11 @@ class Handler(BaseHTTPRequestHandler):
                 _state["autotower_redetect"] = True
             self._send(200, b"OK")
             return
+        if self.path in ("/cmd/autotower/on", "/cmd/autotower/off"):
+            with _lock:
+                _state["autotower_auto"] = self.path.endswith("/on")
+            self._send(200, b"OK")
+            return
         if self.path.startswith("/cmd/dataset/"):
             on = self.path.endswith("/on")
             with _lock:
@@ -845,6 +954,9 @@ class Handler(BaseHTTPRequestHandler):
                 t_hdr = time.time()
                 n = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(n)
+                if len(raw) != n:
+                    self.close_connection = True
+                    return
                 t_body = time.time()
                 with _lock:
                     _android_dbg.append({"at": t_hdr, "body_s": round(t_body - t_hdr, 3), "kb": n // 1024,
@@ -852,14 +964,31 @@ class Handler(BaseHTTPRequestHandler):
                                          "conn": self.headers.get("Connection", ""), "proto": self.request_version,
                                          "draw": self.headers.get("X-Draw"), "enc": self.headers.get("X-Enc"),
                                          "up": self.headers.get("X-Up")})
-                jpeg, ids = _annotate(raw, "android")
                 now = time.time()
+                seq = int(self.headers.get("X-Frame", 0) or 0)   # the app encodes in parallel, so frames can overtake
                 with _lock:
                     recording = bool(_state["capturing"]) and (now - _state["preview_t"] < 3.0)
-                    _state.update(android_jpeg=jpeg, android_raw=raw, android_markers=ids, android_t=now)
+                    last = _state.get("android_frame", 0)
+                    stale = seq > 0 and 0 < last - seq < 100         # a big jump back means the app restarted
+                    if not stale:
+                        _state["android_frame"] = seq
+                if stale:
+                    with _lock:
+                        ids = _state["android_markers"]
+                        saved = _state["android_saved"]
+                    self._send(200, json.dumps({"markers": ids, "recording": recording, "saved": saved}).encode(),
+                               "application/json")
+                    return
+                with _lock:
+                    _state.update(android_raw=raw, android_t=now)
                     _android_times.append(now)
-                saved = 0
-                if recording:
+                    save = recording and now - _state.get("android_saved_t", 0.0) >= 1.0 / max(ANDROID_SAVE_FPS, 0.1)
+                    if save:
+                        _state["android_saved_t"] = now
+                # Markers + overlay run on a worker; the reply doesn't wait for them, so the phone can send the
+                # next frame straight away (it gets the markers of the latest frame the worker finished).
+                _android_cv.submit(raw)
+                if save:
                     ms = int(now * 1000)
                     with open(os.path.join(SAVE_DIR, f"{ms}_android.jpg"), "wb") as f:
                         f.write(raw)
@@ -875,6 +1004,7 @@ class Handler(BaseHTTPRequestHandler):
                                       open(os.path.join(SAVE_DIR, "android_info.json"), "w"))
                 with _lock:
                     saved = _state["android_saved"]
+                    ids = _state["android_markers"]
                 self._send(200, json.dumps({"markers": ids, "recording": recording, "saved": saved}).encode(),
                            "application/json")
             except Exception as e:
@@ -894,6 +1024,8 @@ class Handler(BaseHTTPRequestHandler):
                 raw = self.rfile.read(n)
                 jpeg, ids = _annotate(raw, "iphone")
                 with _lock:
+                    _state["preview_seq"] += 1
+                    _new_frame.notify_all()
                     _state.update(
                         jpeg=jpeg, jpeg_raw=raw, markers=ids, preview_t=time.time(),
                         capturing=self.headers.get("X-Capturing") == "1",
@@ -941,6 +1073,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, f"Server Error: {e}".encode())
             return
 
+        self.close_connection = True        # body not read
         self._send(404, b"Not Found")
 
     def log_message(self, format, *args):
@@ -1083,8 +1216,12 @@ def _dataset_loop():
 
 
 # --- automatic tower setup: layer count + which way the blocks run, from the two cameras ----------------
+AUTO_EVERY = 12.0      # seconds between automatic tower checks
+
+
 def _autotower_loop():
-    """Runs only when the Re-detect button is pressed: a short burst of frames from both cameras, averaged."""
+    """Re-detect (button): a full measurement that resets the tower.  Auto (on by default): a check every
+    AUTO_EVERY seconds that follows layer-count changes and 90-degree turns, keeping the pulled blocks."""
     try:
         import tower_auto as ta
     except Exception as e:
@@ -1104,16 +1241,91 @@ def _autotower_loop():
         with _lock:
             _state["autotower"] = dict({"status": text}, **extra)
 
+    def rotate_frame():
+        k0 = _tp.TOWER_ROT
+        _tp.set_tower_rotation(min(((k0 + 1) % 4, (k0 - 1) % 4), key=lambda k: min(k, 4 - k)))
+        _last_pose.clear(); _pose_lock.clear(); _lock_valid.clear()
+
+    def lidar_layers():
+        """Layer count from the iPhone's LiDAR top height, if it is fresh; steadier than the two-camera edge."""
+        with _lock:
+            top = _state["lidar_top"]
+        if not top or time.time() - top[1] > 3.0:
+            return None
+        return max(1, int(round((top[0] - 2.0) / ta.LAYER_MM)))
+
+    def evidence(ratio):
+        """How clearly the top blocks run one way: the ratio is >1 for x and <1 for y."""
+        return max(ratio, 1.0 / ratio)
+
+    streak = {"key": None, "n": 0}        # an automatic change must be seen twice in a row before it is applied
+
+    def auto_check():
+        """One short burst; changes the layer count or the frame only on a repeated, confident reading.
+        Pulled blocks are kept.  Returns seconds until the next check."""
+        hint = lidar_layers()
+        r = ta.analyse_burst(grab, n=6, interval=0.3, layers_hint=hint)
+        if not r["ok"]:
+            streak.update(key=None, n=0)
+            say(f"auto: no reading ({r['reason'] or 'could not tell which way the top blocks run'}); tower left as it is")
+            return AUTO_EVERY
+        L, axis, ratio = r["layers"], r["axis"], evidence(r["ratio"])
+        with _lock:
+            have = _state["tower"]["layers"]
+        turned = (axis == "x") != ((L - 1) % 2 == 0)
+        if turned and ratio < 2.0:
+            streak.update(key=None, n=0)
+            say(f"auto: {L} layers, but not sure which way the top blocks run (evidence x{ratio:.1f}); tower left as it is")
+            return AUTO_EVERY
+        if not turned and L == have:
+            streak.update(key=None, n=0)
+            say(f"auto: {L} layers ({'LiDAR' if hint else 'cameras'}), top blocks along {axis} - matches", layers=L, axis=axis)
+            return AUTO_EVERY
+        key = (L, axis, turned)
+        streak.update(key=key, n=streak["n"] + 1 if streak["key"] == key else 1)
+        if streak["n"] < 2:
+            say(f"auto: saw {L} layers{' with the tower turned 90 degrees' if turned else ''}; checking again to confirm")
+            return 2.0
+        streak.update(key=None, n=0)
+        if turned:
+            rotate_frame()
+            say("auto: the tower is turned 90 degrees - frame rotated, measuring again")
+            return 2.0
+        with _lock:
+            removed = [list(b) for b in _state["tower"]["removed"]]
+            top_pulled = max((b[0] for b in removed), default=-1)
+            if top_pulled < L:
+                _state["tower"] = {"layers": L, "removed": removed}
+                _state["tower_epoch"] += 1
+                _state["autotower_last"] = f"{L} layers, top blocks along {axis}"
+        if top_pulled >= L:
+            say(f"auto: saw {L} layers, but a block in layer {top_pulled + 1} is marked pulled; ignored")
+        else:
+            say(f"auto: tower is now {L} layers (was {have}, height from the {'LiDAR' if hint else 'cameras'}); "
+                f"{len(removed)} pulled block(s) kept",
+                layers=L, axis=axis, z=r["z"], ncc=r["ncc"], cams=r["cams"])
+        return AUTO_EVERY
+
+    next_auto = time.time() + 5.0
     while True:
         time.sleep(0.4)
         try:
             with _lock:
                 go = _state["autotower_redetect"]
+                auto = _state["autotower_auto"] and not _state["tracker_on"]
                 busy = bool(_state["capturing"]) or _state["dataset"]["on"]
             if not go:
+                if auto and time.time() >= next_auto:
+                    if busy:
+                        say("auto: paused while a game is being recorded")
+                        next_auto = time.time() + AUTO_EVERY
+                    else:
+                        next_auto = time.time() + auto_check()
                 continue
             with _lock:
                 _state["autotower_redetect"] = False
+            streak.update(key=None, n=0)
+            next_auto = time.time() + AUTO_EVERY
             if busy:
                 say("not while a game is being recorded")
                 continue
@@ -1130,21 +1342,19 @@ def _autotower_loop():
                 time.sleep(2.0)
             for attempt in range(1, 4):
                 say(f"measuring (attempt {attempt}/3, keep both phones still)...")
-                r = ta.analyse_burst(grab, n=8, interval=0.3)
+                r = ta.analyse_burst(grab, n=8, interval=0.3, layers_hint=lidar_layers())
                 if not r["ok"]:
                     say(f"attempt {attempt}/3 failed: {r['reason']}")
                     time.sleep(1.0)
                     continue
-                L, axis, ratio = r["layers"], r["axis"], r["ratio"]
+                L, axis, ratio = r["layers"], r["axis"], evidence(r["ratio"])
                 expect_x = ((L - 1) % 2 == 0)
                 if (axis == "x") != expect_x:
                     if ratio < 2.0:
                         say(f"{L} layers, but not sure which way the top blocks run (evidence x{ratio:.1f}). "
                             "Is the top layer complete?")
                         continue
-                    k0 = _tp.TOWER_ROT
-                    _tp.set_tower_rotation(min(((k0 + 1) % 4, (k0 - 1) % 4), key=lambda k: min(k, 4 - k)))
-                    _last_pose.clear(); _pose_lock.clear(); _lock_valid.clear()
+                    rotate_frame()
                     time.sleep(1.0)
                     continue                         # the frame changed: measure again to confirm
                 final = (L, axis, r)
@@ -1156,7 +1366,7 @@ def _autotower_loop():
                     _state["tower_epoch"] += 1
                     _state["autotower_lock"] = True
                     _state["autotower_last"] = f"{L} layers, top blocks along {axis}"
-                say(f"done in {time.time() - t_start:.0f} s: {L} layers, top blocks along {axis}. Locked until you press Re-detect",
+                say(f"done in {time.time() - t_start:.0f} s: {L} layers, top blocks along {axis}",
                     layers=L, axis=axis, z=r["z"], ncc=r["ncc"], cams=r["cams"])
         except Exception as e:
             say(f"error: {type(e).__name__}: {e}")
