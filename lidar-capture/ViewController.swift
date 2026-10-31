@@ -19,8 +19,14 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     let saveEvery = 20  // ~3 saved frames/s at 60 fps; plenty for a game, ~half the data of every-10th
     let previewQueue = DispatchQueue(label: "com.lidarcapture.preview")
     let previewContext = CIContext()
-    var previewBusy = false
-    var previewCount = 0       // every 5th live preview also carries that frame's depth (for the loose-block warning)
+    var previewInFlight = 0    // live previews sent but not yet answered
+    var wired = false          // the Mac's USB bridge is collecting (checked once a second)
+    // Wi-Fi: every 6th camera frame (~10 fps), one at a time, depth on every 5th preview.
+    // Cable: every 2nd frame (~30 fps), 8 at once, depth on every 15th preview -- still ~2 Hz.
+    var previewEvery: Int { wired ? 2 : 6 }
+    var previewMaxInFlight: Int { wired ? 8 : 1 }
+    var depthEvery: Int { wired ? 15 : 5 }
+    var previewCount = 0       // counts live previews; some also carry that frame's depth (for the loose-block warning)
     var uploadsAttempted = 0
     var uploadsFailed = 0
     var statusLabel: UILabel!
@@ -99,6 +105,17 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         markButton.layer.cornerRadius = 12
         markButton.addTarget(self, action: #selector(markMove), for: .touchUpInside)
         view.addSubview(markButton)
+
+        // Wired mode: listens for the Mac's USB bridge; the field turns green while the cable is in use
+        UsbRelay.shared.start()
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let wired = UsbRelay.shared.isWired
+            self.wired = wired
+            self.ipAddressField.backgroundColor = wired ? UIColor.systemGreen.withAlphaComponent(0.9)
+                                                        : UIColor.white.withAlphaComponent(0.9)
+            self.ipAddressField.placeholder = wired ? "USB cable connected" : "Mac IP (printed by the server)"
+        }
         
         print("✅ UI created")
 
@@ -288,7 +305,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
             }
         }
         
-        if totalFrames % 6 == 0 && !previewBusy {  // ~10 fps live view on the Mac, capturing or not
+        if totalFrames % previewEvery == 0 && previewInFlight < previewMaxInFlight {  // live view on the Mac, capturing or not
             sendPreview(frame)
         }
 
@@ -375,9 +392,9 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     func sendPreview(_ frame: ARFrame) {
         guard let ip = ipAddressField.text, !ip.isEmpty,
               let url = URL(string: "http://\(ip):8000/preview") else { return }
-        previewBusy = true
+        previewInFlight += 1
         previewCount += 1
-        let depthPayload: (body: Data, w: Int, h: Int)? = (previewCount % 5 == 0) ? packDepth(frame) : nil
+        let depthPayload: (body: Data, w: Int, h: Int)? = (previewCount % depthEvery == 0) ? packDepth(frame) : nil
         let intr = frame.camera.intrinsics
         let rgbSize = frame.camera.imageResolution
         let buffer = frame.capturedImage
@@ -396,7 +413,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
             let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             guard let cg = self.previewContext.createCGImage(scaled, from: scaled.extent),
                   let jpeg = UIImage(cgImage: cg).jpegData(compressionQuality: 0.6) else {
-                DispatchQueue.main.async { self.previewBusy = false }
+                DispatchQueue.main.async { self.previewInFlight -= 1 }
                 return
             }
             var request = URLRequest(url: url)
@@ -422,18 +439,18 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
                 dreq.setValue("\(Int(rgbSize.width))", forHTTPHeaderField: "X-RgbW")
                 dreq.setValue("\(Int(rgbSize.height))", forHTTPHeaderField: "X-RgbH")
                 dreq.httpBody = dp.body
-                URLSession.shared.dataTask(with: dreq).resume()    // no reply needed
+                self.transmit(dreq)    // no reply needed
             }
-            URLSession.shared.dataTask(with: request) { data, _, _ in
+            self.transmit(request) { data, _, _ in
                 var cmd: [String: Any]? = nil
                 if let data = data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     cmd = obj
                 }
                 DispatchQueue.main.async {
-                    self.previewBusy = false
+                    self.previewInFlight -= 1
                     if let cmd = cmd { self.handleRemote(cmd) }
                 }
-            }.resume()
+            }
         }
     }
 
@@ -546,15 +563,26 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         request.httpBody = body
         
         DispatchQueue.main.async { self.uploadsAttempted += 1 }
-        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+        transmit(request) { [weak self] _, status, error in
             if let error = error {
                 DispatchQueue.main.async { self?.uploadsFailed += 1 }
                 print("❌ Upload failed [\(filename)]: \(error.localizedDescription)")
-            } else if let httpResponse = response as? HTTPURLResponse {
-                if httpResponse.statusCode != 200 { DispatchQueue.main.async { self?.uploadsFailed += 1 } }
-                print(httpResponse.statusCode == 200 ? "✅ \(filename)" : "⚠️ HTTP \(httpResponse.statusCode)")
+            } else if let status = status {
+                if status != 200 { DispatchQueue.main.async { self?.uploadsFailed += 1 } }
+                print(status == 200 ? "✅ \(filename)" : "⚠️ HTTP \(status)")
             }
-        }.resume()
+        }
+    }
+
+    /// Send a request to the Mac: through the USB cable when the Mac's bridge is collecting, otherwise over Wi-Fi.
+    func transmit(_ request: URLRequest, _ done: ((Data?, Int?, Error?) -> Void)? = nil) {
+        if UsbRelay.shared.isWired {
+            UsbRelay.shared.enqueue(request, timeout: request.timeoutInterval, done: done)
+        } else {
+            URLSession.shared.dataTask(with: request) { data, response, error in
+                done?(data, (response as? HTTPURLResponse)?.statusCode, error)
+            }.resume()
+        }
     }
 }
 

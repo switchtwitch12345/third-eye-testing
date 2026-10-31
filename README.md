@@ -93,6 +93,42 @@ scripts/setup.sh                      # venv + dependencies + fetches STEPWISE i
 | `calibrate_camera.py`, `android_cam.py` | Second-camera lens calibration / app-free capture |
 | `fuse_scan.py`, `tsdf_fuse.py`, `refined_fuse.py`, `process_scan.py` | Early mesh-reconstruction experiments (superseded) |
 
+## Third Eye UI (Aadit's repo + our game console)
+
+`third_party/STEPWISE` is Aadit Pani's Third Eye repo (branch `jenga-real-data-eval`): rule checker, 3D tower,
+"Ask the referee" LLM panel, and a follow bridge that judges the pulls our server confirms. Our **Game** tab sits in
+his UI and has every control of our own viewer (cameras with the red/green/amber overlay, START/MARK/STOP,
+left/middle/right box, Re-detect, tower settings, data capture, coverage, NO MOVES LEFT / GAME OVER).
+
+```bash
+scripts/setup.sh        # once: clones his repo, applies patches/thirdeye-game-console.patch, builds his env + UI
+scripts/start_all.sh    # game server on :8000 (phones connect here) + Third Eye UI on http://localhost:8001/#/game
+```
+The Game tab talks to our server through his server's `/game/...` proxy (`thirdeye/server/gameproxy.py`: a fixed
+allow-list of paths, one fixed address). Press **Judge this game with Third Eye rules** to open his Live tab on the
+same game. His LLM features need a key in `third_party/STEPWISE/.env` (e.g. `GROQ_API_KEY=...`).
+
+**The overlay fits the real tower.** `tower_fit.py` lines a 75 x 75 mm model of the tower (and the board under it) up with
+the iPhone's LiDAR points every half second and folds the result into the pose that every overlay, face crop and depth
+check uses (`tower_points.set_correction`): the tower's real position, tilt and twist, and its height. It settles in about
+3 seconds after the app starts streaming depth; **Re-detect** refits from scratch and sets the layer count from the height
+(height / 15 mm, checked on five recorded towers). Tests: `test_tower_fit.py`, `test_height_replay.py`.
+
+## Wired mode (USB cable instead of Wi-Fi)
+
+Optional. The phones work over Wi-Fi exactly as before; with a cable the picture is smoother (about 15-30 fps instead of about 10).
+
+* **iPhone.** A cable lets the Mac reach the phone but not the other way round, so the app (`lidar-capture/UsbRelay.swift`)
+  queues its requests on port 8765 and `scripts/usb_bridge.py` (through `iproxy`) collects them, plays them to the game
+  server and hands the answers back. The app notices the bridge by itself (the IP box turns green) and falls back to
+  Wi-Fi a few seconds after the bridge stops. On the cable it sends every 2nd frame, 8 at once; on Wi-Fi every 6th, 1 at a time.
+  Needs `brew install libimobiledevice`; run `.venv/bin/python scripts/usb_bridge.py` next to the game server.
+* **Android.** Nothing to relay: `adb reverse tcp:8000 tcp:8000` (what `scripts/wired.sh` does) makes the Mac's game
+  server appear as `localhost:8000` on the phone, so the browser page `http://localhost:8000/cam` (or a native app that
+  POSTs JPEG frames to `/android`) works with no network. Needs `brew install android-platform-tools` and USB debugging.
+  There is no native Android app in this repo yet: the camera is the `/cam` web page. A native app only has to POST each
+  frame to `http://localhost:8000/android` (body = JPEG, optional headers `X-Draw`, `X-Enc`, `X-Up`) after `adb reverse`.
+
 ## Notes
 * Recordings and the dataset are deliberately not in this repo (large; they show people). `docs/` has tower-only figures.
 * Tower orientation matters: the marker frame is turned so the bottom layer runs along x

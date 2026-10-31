@@ -114,19 +114,16 @@ def rigid2d(src, dst):
     return R, cb - R @ ca
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--frames", type=int, default=16)
-    ap.add_argument("--dry-run", action="store_true", help="measure and report, do not write marker_map.json")
-    args = ap.parse_args()
-
-    st = json.loads(urllib.request.urlopen(SERVER + "/status.json", timeout=5).read())
+def measure_map(n_frames=16, grab_fn=None, pause=0.45, log=print):
+    """Measure where the four markers really are (tower frame, mm) from both cameras' live pictures.
+    Returns {id: {"x", "y", "yaw"}}; raises RuntimeError saying what is missing."""
+    grab_fn = grab_fn or grab
     cams = {"iphone": "/preview_raw.jpg", "android": "/android_raw.jpg"}
     frames = {"iphone": [], "android": []}
-    print(f"collecting {args.frames} frames from each camera (keep both phones still)...")
-    for _ in range(args.frames):
+    log(f"collecting {n_frames} frames from each camera (keep both phones still)...")
+    for _ in range(n_frames):
         for name, path in cams.items():
-            img = grab(path)
+            img = grab_fn(path)
             if img is None:
                 continue
             h, w = img.shape[:2]
@@ -139,17 +136,15 @@ def main():
             p = marker_poses(img, K, dist)
             if len(p) >= 3:
                 frames[name].append(p)
-        time.sleep(0.45)
+        time.sleep(pause)
     maps = {n: camera_map(f, n) for n, f in frames.items() if len(f) >= 3}
     if len(maps) < 2:
-        sys.exit(f"need usable frames from BOTH cameras; got { {n: len(f) for n, f in frames.items()} }. "
-                 "Check that both phones show 3+ markers in the viewer.")
-
+        raise RuntimeError(f"need 3+ markers visible in BOTH cameras; usable frames { {n: len(f) for n, f in frames.items()} }")
     # stitch: express the iPhone map in the Android gauge through the markers both see
     A, B = maps["android"], maps["iphone"]
     common = sorted(set(A) & set(B))
     if len(common) < 2:
-        sys.exit(f"the cameras share only markers {common}; need at least 2 in common")
+        raise RuntimeError(f"the cameras share only markers {common}; need at least 2 in common")
     R, tr = rigid2d([B[i][:2] for i in common], [A[i][:2] for i in common])
     rot = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
     resid = [float(np.linalg.norm(R @ np.array(B[i][:2]) + tr - np.array(A[i][:2]))) for i in common]
@@ -161,7 +156,7 @@ def main():
             p = R @ np.array([x, y]) + tr
             G[i] = (float(p[0]), float(p[1]), float((yaw + rot + 180) % 360 - 180))
     if sorted(G) != [0, 1, 2, 3]:
-        sys.exit(f"could only place markers {sorted(G)}; all four are needed")
+        raise RuntimeError(f"could only place markers {sorted(G)}; all four are needed")
 
     # tower frame: origin = middle of the ring, +x along ID1 -> ID2 (and ID0 -> ID3)
     pts = {i: np.array(G[i][:2]) for i in G}
@@ -170,7 +165,7 @@ def main():
     xv /= np.linalg.norm(xv)
     yv = np.array([-xv[1], xv[0]])
     if (pts[0] - pts[1]) @ yv < 0:
-        sys.exit("the ring runs the other way round from the one this software assumes (IDs must go "
+        raise RuntimeError("the ring runs the other way round from the one this software assumes (IDs must go "
                  "1 -> 2 -> 3 -> 0 counter-clockwise seen from above); swap two markers or tell me")
     ang = float(np.degrees(np.arctan2(xv[1], xv[0])))
     out = {}
@@ -184,6 +179,18 @@ def main():
     for i in sorted(out):
         print(f"  ID{i}: x {out[i]['x']:+7.1f}  y {out[i]['y']:+7.1f}  yaw {out[i]['yaw']:+7.1f} deg")
     print(f"ring sides {np.round(side, 1).tolist()} mm | diagonals {np.round(diag, 1).tolist()} mm")
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--frames", type=int, default=16)
+    ap.add_argument("--dry-run", action="store_true", help="measure and report, do not write marker_map.json")
+    args = ap.parse_args()
+    try:
+        out = measure_map(args.frames)
+    except RuntimeError as e:
+        sys.exit(str(e))
     path = os.path.join(HERE, "marker_map.json")
     if args.dry_run:
         print("(dry run, not written)")

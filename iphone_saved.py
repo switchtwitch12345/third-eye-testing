@@ -48,7 +48,7 @@ _state = {
     "tracking": "?", "marks": 0, "want": None, "mark_seq": 0, "files": 0,
     "android_jpeg": None, "android_raw": None, "jpeg_raw": None, "android_markers": [], "android_t": 0.0,
     "android_saved": 0, "android_size": None,
-    "tower": {"layers": 10, "removed": []}, "loose": [], "loose_info": None, "game_over": None, "height_info": None, "overlay": None, "android_overlay": None,
+    "tower": {"layers": 10, "removed": []}, "loose": [], "loose_info": None, "game_over": None, "height_info": None, "tower_fit": None, "overlay": None, "android_overlay": None, "labels": {},
     "autotower": {"status": "waiting for both cameras"}, "marks_log": [], "last_label": None, "label_stats": {"moves": 0, "wrong": 0}, "autotower_lock": True, "autotower_last": "none yet", "autotower_redetect": False, "tower_epoch": 0, "tracker_msg": "tracker idle - press START", "tracker_on": False,
     "dataset": {"on": False, "name": None, "frames": 0, "crops": 0, "total_crops": 0, "total_frames": 0}, "started": time.time(), "image_size": None,
 }
@@ -137,16 +137,29 @@ font-size:14px;cursor:pointer;margin-top:14px;width:100%}
 <script>
 const c=document.getElementById('c'), c2=document.getElementById('c2');
 const rots={a:+(localStorage.getItem('rotA')||90), b:+(localStorage.getItem('rotB')||0)};
-function drawTo(cv,img,rot){
+let LAB={};
+const LEG=[['white: layer, counted from the bottom','#fff'],['yellow digit: slot of layers 1,3,5,7,9','#ffd700'],['cyan digit: slot of layers 2,4,6,8,10','#00dcff']];
+function drawTo(cv,img,rot,lab){
   const x=cv.getContext('2d');
   const sw=rot%180? img.naturalHeight:img.naturalWidth, sh=rot%180? img.naturalWidth:img.naturalHeight;
   if(cv.width!==sw||cv.height!==sh){cv.width=sw;cv.height=sh}
   x.save();x.translate(cv.width/2,cv.height/2);x.rotate(rot*Math.PI/180);
   x.drawImage(img,-img.naturalWidth/2,-img.naturalHeight/2);x.restore();
+  const k=img.naturalWidth/960, a=rot*Math.PI/180, co=Math.cos(a), si=Math.sin(a);
+  if(lab&&lab.w===img.naturalWidth&&lab.h===img.naturalHeight){   // labels are drawn upright, at the turned positions
+    for(const [t,px,py,sc,col] of lab.items){
+      const dx=px-lab.w/2, dy=py-lab.h/2, X=cv.width/2+dx*co-dy*si, Y=cv.height/2+dx*si+dy*co;
+      x.font='bold '+Math.round(sc*34*k)+'px sans-serif'; x.lineWidth=4*k; x.strokeStyle='#000'; x.strokeText(t,X,Y);
+      x.fillStyle=col; x.fillText(t,X,Y);
+    }
+  }
+  const lh=Math.round(22*k); x.font=Math.round(15*k)+'px sans-serif';
+  x.fillStyle='#000'; x.fillRect(4*k,cv.height-4*k-lh*3-6*k,330*k,lh*3+6*k);
+  LEG.forEach(([t,col],i)=>{x.fillStyle=col;x.fillText(t,10*k,cv.height-10*k-lh*(2-i))});
 }
 function feed(cv,url,which,gap){
   const im=new Image();
-  im.onload=()=>{drawTo(cv,im,rots[which]);setTimeout(()=>feed(cv,url,which,gap),gap)};
+  im.onload=()=>{drawTo(cv,im,rots[which],which==='a'?LAB.iphone:LAB.android);setTimeout(()=>feed(cv,url,which,gap),gap)};
   im.onerror=()=>setTimeout(()=>feed(cv,url,which,gap),600);
   im.src=url+'?'+Date.now();
 }
@@ -176,7 +189,7 @@ function rotate(w){rots[w]=(rots[w]+90)%360;localStorage.setItem(w==='a'?'rotA':
 const $=id=>document.getElementById(id);
 async function poll(){
   try{
-    const s=await (await fetch('/status.json')).json();
+    const s=await (await fetch('/status.json')).json(); LAB=s.labels||{};
     const live=s.preview_age!==null&&s.preview_age<2;
     const r=$('rec');
     if(!live){r.className='chip idle';r.textContent='no phone preview';}
@@ -323,6 +336,16 @@ def removable(layers, removed):
 _FACES = [(0, 1, 3, 2), (4, 5, 7, 6), (0, 1, 5, 4), (2, 3, 7, 6), (0, 2, 6, 4), (1, 3, 7, 5)]
 
 
+_sink = threading.local()      # text is not baked into the picture: the viewer draws it upright after turning the view
+
+
+def _text(text, xy, col, scale=0.55):
+    """Queue a label for this frame (x, y in picture pixels, col = BGR); _annotate hands them to the viewer."""
+    items = getattr(_sink, "items", None)
+    if items is not None:
+        items.append([text, int(xy[0]), int(xy[1]), scale, "#%02x%02x%02x" % (col[2], col[1], col[0])])
+
+
 def _ruler(img, K, R, t, cam, layers):
     """Read-off labels so a block can be named: layer numbers up a corner, slot digits along the base.
     yellow digits = slot for layers 1,3,5,..   cyan digits = slot for layers 2,4,6,.."""
@@ -335,8 +358,7 @@ def _ruler(img, K, R, t, cam, layers):
             return
         u = K @ c
         xy = (int(u[0] / u[2]) - 6 + dx, int(u[1] / u[2]) + 5)
-        cv2.putText(img, text, xy, F, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(img, text, xy, F, 0.55, col, 1, cv2.LINE_AA)
+        _text(text, xy, col)
 
     sx = 1.0 if cam[0] >= 0 else -1.0
     sy = 1.0 if cam[1] >= 0 else -1.0
@@ -354,29 +376,11 @@ def _ruler(img, K, R, t, cam, layers):
     side = 14 if sx_of(out) >= sx_of(edge) else -26
     for l in range(layers):
         label(str(l + 1), (edge[0], edge[1], _HEIGHT * (l + 0.5)), WHT, dx=side)
-    lines = (("white: layer, counted from the bottom", WHT),
-             ("yellow digit: slot of layers 1,3,5,7,9", YEL),
-             ("cyan digit: slot of layers 2,4,6,8,10", CYA))
-    h = img.shape[0]
-    cv2.rectangle(img, (4, h - 4 - 22 * len(lines)), (330, h - 4), (0, 0, 0), -1)
-    for i, (text, col) in enumerate(lines):
-        cv2.putText(img, text, (10, h - 10 - 22 * (len(lines) - 1 - i)), F, 0.5, col, 1, cv2.LINE_AA)
 
 
 _last_pose = {}      # kind -> (R, t, time): a phone on a stand does not move in a second
 _pose_lock = {}      # kind -> (R, t): the last good pose; phones sit on stands, so it stays valid until they are bumped
 _lock_valid = {}     # kind -> time the lock was last confirmed (3+ markers, or visible markers still land where it says)
-
-
-def _banner(img, text):
-    """Big red label across the top of the picture."""
-    h, w = img.shape[:2]
-    scale = w / 640.0
-    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, max(2, int(3 * scale)))
-    x0, y0 = (w - tw) // 2 - int(14 * scale), int(10 * scale)
-    cv2.rectangle(img, (x0, y0), (x0 + tw + int(28 * scale), y0 + th + int(24 * scale)), (30, 30, 200), -1)
-    cv2.putText(img, text, (x0 + int(14 * scale), y0 + th + int(12 * scale)), cv2.FONT_HERSHEY_SIMPLEX, scale,
-                (255, 255, 255), max(2, int(3 * scale)), cv2.LINE_AA)
 
 
 def _no_moves(tower):
@@ -401,7 +405,9 @@ def _draw_overlay(img, K, dist, dets, tower, kind=None):
         R, t, _ = sol
         if kind:
             _last_pose[kind] = (R, t, time.time())
-            _pose_lock[kind] = (R, t)
+            Rc, tc = _tp.get_correction()                  # keep the lock in the marker frame, whatever the fit says later
+            Rm = R @ Rc.T
+            _pose_lock[kind] = (Rm, t - Rm @ tc)
             _lock_valid[kind] = time.time()
     elif kind and dets and kind in _pose_lock:      # fewer than 3 markers: do the ones we see still sit where the lock says?
         try:
@@ -422,7 +428,7 @@ def _draw_overlay(img, K, dist, dets, tower, kind=None):
         if held and time.time() - held[2] <= 1.5:
             R, t, _ = held
         elif kind in _pose_lock and time.time() - _lock_valid.get(kind, 0) <= 6.0:
-            R, t = _pose_lock[kind]        # markers covered, but the ones still visible say the phone has not moved
+            R, t = _tp._corrected(*_pose_lock[kind])   # markers covered, but the ones still visible say the phone has not moved
         else:
             return None
     layers = int(tower["layers"])
@@ -462,10 +468,6 @@ def _draw_overlay(img, K, dist, dets, tower, kind=None):
             cv2.polylines(img, [quad.reshape(-1, 1, 2)], True, col, 2, cv2.LINE_AA)
     cv2.addWeighted(fill, 0.38, img, 0.62, 0, img)
     _ruler(img, K, R, t, cam, layers)
-    if tower.get("game_over"):
-        _banner(img, "GAME OVER - PIECES FELL")
-    elif ok and not any(ok.values()):
-        _banner(img, "NO MOVES LEFT")
     n_amber = sum(1 for k, g in ok.items() if g and k in loose)
     return {"green": int(sum(ok.values())) - n_amber, "amber": n_amber, "red": int(len(ok) - sum(ok.values()))}
 
@@ -480,11 +482,14 @@ def _annotate(jpeg_bytes, kind=None):
         return jpeg_bytes, []
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = _DETECTOR.detectMarkers(gray)
+    _sink.items = []
     found, dets = [], {}
     if ids is not None:
         found = sorted(int(i) for i in ids.flatten() if int(i) < 4)
-        cv2.aruco.drawDetectedMarkers(img, corners, ids, (0, 255, 0))
+        cv2.aruco.drawDetectedMarkers(img, corners, None, (0, 255, 0))
         dets = {int(i): c.reshape(4, 2).astype(np.float64) for c, i in zip(corners, ids.flatten()) if int(i) < 4}
+        for i, c in dets.items():
+            _text(f"id={i}", c.mean(axis=0) - (18, -4), (255, 0, 0), 0.5)
     stats = None
     if kind:
         h, w = img.shape[:2]
@@ -498,6 +503,10 @@ def _annotate(jpeg_bytes, kind=None):
                 stats = None
         with _lock:
             _state["overlay" if kind == "iphone" else "android_overlay"] = stats
+    if kind:
+        with _lock:
+            _state["labels"][kind] = {"w": img.shape[1], "h": img.shape[0], "items": _sink.items}
+    _sink.items = None
     ok, out = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
     return (out.tobytes() if ok else jpeg_bytes), found
 
@@ -510,18 +519,85 @@ DROP_MM = 20.0         # the top of the tower falling by more than a layer (15 m
 _height_st = {"epoch": None, "layers": None, "ref": [], "hist": []}
 
 
-def _watch_height(P, epoch, layers):
+FIT_GAIN = 0.6              # how much of each fitted correction to take (smooths out noise, still settles in ~3 readings)
+_fit_lock = threading.Lock()
+_fit_st = {"epoch": None, "Hs": [], "ok": 0, "converged": False, "reads": 0, "relayer": False}
+
+
+def _reset_fit(relayer=False):
+    """Forget the fitted correction (after Re-detect, or a tower rebuilt somewhere else)."""
+    with _fit_lock:
+        _tp.reset_correction()
+        _fit_st.update(Hs=[], ok=0, converged=False, reads=0, relayer=relayer)
+        _height_st.update(ref=[], hist=[])
+    with _lock:
+        _state["tower_fit"] = None
+
+
+def _fit_tower(P, epoch):
+    """Fit the real tower (position, tilt, twist, height) to the LiDAR points and fold it into the pose correction
+    that every camera's overlay and every face crop uses.  Returns (P in the corrected frame, converged?)."""
+    import tower_fit as tf
+    with _fit_lock:
+        if _fit_st["epoch"] != epoch:
+            _fit_st.update(epoch=epoch)
+        f = tf.fit_box(P)
+        _fit_st["reads"] += 1
+        if f is None:
+            return P, _fit_st["converged"] or _fit_st["reads"] >= 20, None
+        Hs = _fit_st["Hs"]
+        ref_H = float(np.median(Hs)) if len(Hs) >= 5 else None
+        good = f["inliers"] >= 0.55 and f["rms"] <= 4.0 and (ref_H is None or abs(f["H"] - ref_H) <= 12.0)
+        if good:
+            rv = tf.log(f["R"]) * FIT_GAIN                  # a fraction of the step: noise averages out
+            Rd, td = tf.rot(rv), f["t"] * FIT_GAIN
+            Rc, tc = _tp.get_correction()
+            _tp.set_correction(Rc @ Rd, Rc @ td + tc)
+            P = (P - td) @ Rd                              # the same points, now in the corrected frame
+            Hs.append(f["H"]); del Hs[:-15]
+            small = float(np.linalg.norm(f["t"])) < 1.2 and f["tilt_deg"] < 0.35 and abs(f["yaw_deg"]) < 0.5
+            _fit_st["ok"] = _fit_st["ok"] + 1 if small else 0
+            if _fit_st["ok"] >= 2:
+                _fit_st["converged"] = True
+        Hm = float(np.median(Hs)) if Hs else f["H"]
+        info = {"shift_mm": [round(float(x), 1) for x in f["t"]], "tilt_deg": round(f["tilt_deg"], 2),
+                "twist_deg": round(f["yaw_deg"], 2), "height_mm": round(Hm, 1), "layers_float": round((Hm - tf.TOP_OFFSET) / tf.LAYER_MM, 2),
+                "layers": tf.layers_from_height(Hm), "inliers": round(f["inliers"], 2), "rms_mm": round(f["rms"], 2),
+                "converged": _fit_st["converged"], "at": time.strftime("%H:%M:%S")}
+        done = _fit_st["converged"] or _fit_st["reads"] >= 20
+        h_obs = float(f["H"]) if f["inliers"] >= 0.45 else None       # the top, from ALL the points (not a small window)
+    with _lock:
+        _state["tower_fit"] = info
+        if _fit_st["relayer"] and info["converged"] and len(Hs) >= 5:
+            frac = abs(info["layers_float"] - round(info["layers_float"]))
+            _fit_st["relayer"] = False
+            if frac <= 0.4:                                     # clearly n layers, not halfway between two counts
+                _state["tower"] = {"layers": info["layers"], "removed": []}
+                _state["tower_epoch"] += 1
+                _state["autotower"] = {"status": f"LiDAR: tower measured {info['height_mm']:.0f} mm = {info['layers']} layers", "layers": info["layers"]}
+            else:
+                _state["autotower"] = {"status": f"LiDAR: tower is {info['height_mm']:.0f} mm = {info['layers_float']:.1f} layers: "
+                                                 f"type {int(info['layers_float'])} or {int(info['layers_float']) + 1}"}
+    return P, done, h_obs
+
+
+def _watch_height(P, epoch, layers, ready=True, h_obs=None):
     """Top-of-tower height from the depth points over the tower's core.  A legal turn never changes it (the top
     complete layer cannot be pulled), so a drop of more than a layer for 3 readings in a row = game over."""
     if (_height_st["epoch"], _height_st["layers"]) != (epoch, layers):
         _height_st.update(epoch=epoch, layers=layers, ref=[], hist=[])
         with _lock:
             _state["game_over"] = None
-    core = (np.abs(P[:, 0]) < 30) & (np.abs(P[:, 1]) < 30) & (P[:, 2] > 20)
-    z = P[core, 2]
-    if len(z) < 60:
-        return
-    top = float(np.percentile(z, 95))
+    if not ready:
+        return                                                # wait until the fit has settled: only then is the window on the tower
+    if h_obs is not None:
+        top = h_obs                                           # the fitted top: robust, and independent of the marker pose
+    else:                                                     # no usable fit (collapsed? hidden?): the small window as before
+        core = (np.abs(P[:, 0]) < 30) & (np.abs(P[:, 1]) < 30) & (P[:, 2] > 20)
+        z = P[core, 2]
+        if len(z) < 60:
+            return
+        top = float(np.percentile(z, 95))
     if len(_height_st["ref"]) < 8:
         _height_st["ref"].append(top)                # the first readings of a new tower: its normal height
         return
@@ -530,7 +606,7 @@ def _watch_height(P, epoch, layers):
     cur = float(np.median(_height_st["hist"]))
     with _lock:
         _state["height_info"] = {"top_mm": round(cur, 1), "start_mm": round(ref, 1),
-                                 "lidar_layers": int(round((ref - 2.0) / 15.0)), "at": time.strftime("%H:%M:%S")}
+                                 "lidar_layers": int(round(ref / 15.0)), "at": time.strftime("%H:%M:%S")}
         if len(_height_st["hist"]) >= 3 and cur <= ref - DROP_MM and not _state["game_over"]:
             _state["game_over"] = {"reason": f"the top of the tower dropped {ref - cur:.0f} mm "
                                              f"(about {(ref - cur) / 15:.1f} layers): pieces fell",
@@ -548,10 +624,8 @@ def _process_depth(h, body):
     now = time.time()
     held = _last_pose.get("iphone")
     live = bool(held and now - held[2] <= 3.0)
-    if live:
-        R, t, _ = held
-    elif "iphone" in _pose_lock and now - _lock_valid.get("iphone", 0) <= 6.0:
-        R, t = _pose_lock["iphone"]            # markers hidden (fallen blocks?), but the phone has not moved
+    if "iphone" in _pose_lock and now - _lock_valid.get("iphone", 0) <= 6.0:
+        R, t = _tp._corrected(*_pose_lock["iphone"])   # markers may be hidden (fallen blocks?), but the phone has not moved
     else:
         return
     depth = np.frombuffer(body[:4 * n], np.float32).reshape(hh, w)
@@ -563,7 +637,9 @@ def _process_depth(h, body):
     if (_loose_st["epoch"], _loose_st["layers"]) != (epoch, layers):
         _loose_st.update(epoch=epoch, layers=layers, base={}, hist={}, streak={})       # new tower: learn its faces afresh
     P = dp.depth_points(depth, conf, K, int(h["X-RgbW"]), int(h["X-RgbH"]), R, t)
-    _watch_height(P, epoch, layers)
+    P, ready, h_obs = _fit_tower(P, epoch)          # line the tower model up with the points; P is now in the fitted frame
+    R, t = _tp._corrected(*_pose_lock["iphone"])
+    _watch_height(P, epoch, layers, ready, h_obs)
     if not live:
         return
     offs = dp.face_offsets(P, -R.T @ t, layers)
@@ -662,7 +738,7 @@ class Handler(BaseHTTPRequestHandler):
                 "android_markers": s["android_markers"], "android_saved": s["android_saved"],
                 "android_age": (now - s["android_t"]) if s["android_t"] else None,
                 "android_size": s["android_size"], "android_dbg": list(_android_dbg)[-12:], "tower": s["tower"], "tracker_msg": s["tracker_msg"], "tracker_on": s["tracker_on"], "dataset": s["dataset"], "autotower": s["autotower"], "last_label": s["last_label"], "label_stats": s["label_stats"], "marks_pending": sum(1 for m in s["marks_log"] if not m["labelled"]),
-                "overlay": s["overlay"], "android_overlay": s["android_overlay"], "loose": s["loose"], "loose_info": s["loose_info"], "no_moves": _no_moves(s["tower"]), "game_over": s["game_over"], "height_info": s["height_info"],
+                "overlay": s["overlay"], "android_overlay": s["android_overlay"], "labels": s["labels"], "loose": s["loose"], "loose_info": s["loose_info"], "no_moves": _no_moves(s["tower"]), "tower_epoch": s["tower_epoch"], "game_over": s["game_over"], "height_info": s["height_info"], "tower_fit": s["tower_fit"],
             }).encode()
             self._send(200, body, "application/json")
         else:
@@ -737,6 +813,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, f"bad label: {e}".encode())
             return
         if self.path == "/cmd/redetect":
+            _reset_fit(relayer=True)             # LiDAR: re-measure where the tower stands and how tall it is
             with _lock:
                 _state["autotower_redetect"] = True
             self._send(200, b"OK")
@@ -1041,6 +1118,16 @@ def _autotower_loop():
                 say("not while a game is being recorded")
                 continue
             final, t_start = None, time.time()
+            try:                                  # the board may sit differently every game: measure where the markers are
+                import calibrate_markers as cm
+                say("measuring where the markers are (keep both phones still)...")
+                mm = cm.measure_map(10, grab_fn=lambda p: grab()["iphone" if "preview" in p else "android"], pause=0.3, log=lambda m: None)
+                _tp.save_marker_map(mm, time.strftime("%Y-%m-%d %H:%M:%S"))
+                _pose_lock.clear(); _lock_valid.clear()
+                _reset_fit(relayer=True)
+            except Exception as e:
+                say(f"could not re-measure the markers ({e}); using the last measurement")
+                time.sleep(2.0)
             for attempt in range(1, 4):
                 say(f"measuring (attempt {attempt}/3, keep both phones still)...")
                 r = ta.analyse_burst(grab, n=8, interval=0.3)

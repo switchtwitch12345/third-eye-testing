@@ -47,6 +47,10 @@ for ts in stamps[::3]:
         continue
     R, t, _ = sol
     srv._last_pose["iphone"] = (R, t, time.time())
+    Rc, tc = tp.get_correction()                                  # the server keeps its pose lock in the raw marker frame
+    Rm = R @ Rc.T
+    srv._pose_lock["iphone"] = (Rm, t - Rm @ tc)
+    srv._lock_valid["iphone"] = time.time()
     rw, rh = fr["rgb"].shape[1], fr["rgb"].shape[0]
     if target is None:
         offs = dp.face_offsets(orig(fr["depth"], fr["conf"], fr["K"], rw, rh, R, t), -R.T @ t, 9)

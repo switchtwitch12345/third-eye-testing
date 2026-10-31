@@ -59,6 +59,14 @@ def _load_marker_map():
     _apply_rotation(rot)
 
 
+def save_marker_map(markers, created):
+    """Write a freshly measured marker map (keeps the saved tower turn) and use it straight away."""
+    j = json.load(open(_MAP_PATH)) if os.path.exists(_MAP_PATH) else {}
+    j.update({"created": created, "marker_mm": 40.0, "markers": {str(i): v for i, v in markers.items()}})
+    json.dump(j, open(_MAP_PATH, "w"), indent=2)
+    _load_marker_map()
+
+
 def set_tower_rotation(k, persist=True):
     """Turn the tower frame (used when the bottom layer runs the other way). Saved next to the marker map."""
     _apply_rotation(k)
@@ -112,6 +120,30 @@ def detect(rgb):
             if int(i) in CENTRES:
                 out[int(i)] = c.reshape(4, 2).astype(np.float64)
     return out
+
+
+# A correction to the marker-defined tower frame, measured from the LiDAR (tower_fit.py): the tower's real position,
+# tilt and twist.  x_marker_frame = _CORR_R @ x_tower + _CORR_T.  Identity until a fit says otherwise.
+_CORR = (np.eye(3), np.zeros(3))      # replaced as one tuple, so a thread solving a pose never sees half of a swap
+
+
+def set_correction(R, t):
+    global _CORR
+    _CORR = (np.asarray(R, float).copy(), np.asarray(t, float).copy())
+
+
+def get_correction():
+    return _CORR[0].copy(), _CORR[1].copy()
+
+
+def reset_correction():
+    set_correction(np.eye(3), np.zeros(3))
+
+
+def _corrected(R, t):
+    """Pose of the CORRECTED tower frame in the camera: x_cam = R x_marker + t, x_marker = Rc x_tower + tc."""
+    Rc, tc = _CORR
+    return R @ Rc, t + R @ tc
 
 
 def solve(dets, K, rot=None, layout=None):
@@ -181,7 +213,10 @@ def solve(dets, K, rot=None, layout=None):
             continue
         if best is None or err < best[2]:
             best = (R2, tv2.reshape(3), err)
-    return best
+    if best is None:
+        return None
+    R_, t_ = _corrected(best[0], best[1])
+    return R_, t_, best[2]
 
 
 def depth_to_tower(fr, R, t, min_conf=2, dmax=1.5):
