@@ -3374,7 +3374,7 @@ index 0000000..47e5df7
 +}
 diff --git a/web/src/pages/Game.tsx b/web/src/pages/Game.tsx
 new file mode 100644
-index 0000000..0e18e70
+index 0000000..f8cb083
 --- /dev/null
 +++ b/web/src/pages/Game.tsx
 @@ -0,0 +1,439 @@
@@ -3789,6 +3789,8 @@ index 0000000..0e18e70
 +          <div className={`g-chip ${mk[0]}`}>iPhone · {mk[1]}</div>
 +          <div className={`g-chip ${am[0]}`}>Android · {am[1]}</div>
 +          <div className="g-line"><span>Phone tracking</span><span>{s.tracking}</span></div>
++          <button className="g-btn" onClick={() => rotate("a")}>Rotate iPhone view <kbd>R</kbd></button>
++          <button className="g-btn" onClick={() => rotate("b")}>Rotate Android view <kbd>T</kbd></button>
 +          <button className="g-btn" onClick={() => cmd("redetect")} disabled={!!s.locked}>Re-detect tower</button>
 +          <button className={`g-btn ${s.locked ? "g-green" : "g-blue"}`} onClick={() => post(s.locked ? "cmd/lock/off" : "cmd/lock/on")}>
 +            {s.locked ? "Overlay locked · click to unlock" : "Lock overlay when it looks right"}
@@ -3799,8 +3801,6 @@ index 0000000..0e18e70
 +            <button className="g-btn g-blue" onClick={showCoverage}>Check coverage: which blocks can I judge?</button>
 +            {coverage && <pre className="g-pre">{coverage}</pre>}
 +            <div className={`g-chip small ${tmCls}`} style={{ marginTop: 8 }}>{tm || "tracker idle"}</div>
-+            <button className="g-btn" onClick={() => rotate("a")}>Rotate iPhone view <kbd>R</kbd></button>
-+            <button className="g-btn" onClick={() => rotate("b")}>Rotate Android view <kbd>T</kbd></button>
 +            <div className="g-line"><span>Preview</span><span>{live ? `${s.preview_fps.toFixed(1)} fps` : "–"}</span></div>
 +            <div className="g-line"><span>Uploads</span><span>{s.upload_rate.toFixed(1)} files/s ({s.files} total)</span></div>
 +            <p className="g-hint">L is the layer from the bottom (1 = bottom), S the slot (0, 1 or 2). Green can be pulled, amber is loose, red is not allowed. At least 3 markers should be visible; keep the phones still while recording.</p>
@@ -3819,10 +3819,10 @@ index 0000000..0e18e70
 +}
 diff --git a/web/src/pages/GamePanel.tsx b/web/src/pages/GamePanel.tsx
 new file mode 100644
-index 0000000..b68eaa3
+index 0000000..088b726
 --- /dev/null
 +++ b/web/src/pages/GamePanel.tsx
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,278 @@
 +// The Game page's controls, inside the 3D tower page: record, mark, answer Yes / No, type the move, tower settings,
 +// camera status and overlay lock.  It talks to the game server through the same /game/... proxy as the Game page;
 +// each confirmed pull reaches the 3D tower through the follow session, so the block comes off in real time.
@@ -3867,6 +3867,7 @@ index 0000000..b68eaa3
 +
 +export default function GamePanel() {
 +  const [s, setS] = useState<GameStatus | null>(null);
++  const [rotA, setRotA] = useState(() => saved("rotA", 90));
 +  const [offline, setOffline] = useState("");
 +  const [layers, setLayers] = useState("10");
 +  const [removed, setRemoved] = useState("");
@@ -3901,19 +3902,27 @@ index 0000000..b68eaa3
 +
 +  // The finder maps "left / middle / right" onto the picture as the Game page shows it, so tell it the turn that page uses.
 +  useEffect(() => {
-+    const send = () => post("cmd/viewrot", { iphone: saved("rotA", 90) });
++    const send = () => post("cmd/viewrot", { iphone: rotA });
 +    send();
 +    const id = window.setInterval(send, 4000);
 +    return () => clearInterval(id);
-+  }, []);
++  }, [rotA]);
 +
++  const rotate = (which: "a" | "b") => {          // the same turn the Game page keeps, so the finder and both pages agree
++    const k = which === "a" ? "rotA" : "rotB";
++    const n = (saved(k, which === "a" ? 90 : 0) + 90) % 360;
++    try { localStorage.setItem(k, String(n)); } catch { /* private mode */ }
++    if (which === "a") { setRotA(n); post("cmd/viewrot", { iphone: n }); }
++  };
 +  const cmd = (name: string) => { post(`cmd/${name}`); };
 +
 +  // Space = MARK, Y / N = answer (not while typing in a box)
 +  useEffect(() => {
 +    const onKey = (e: KeyboardEvent) => {
 +      if ((e.target as HTMLElement | null)?.tagName === "INPUT") return;
-+      if (e.code === "Space") { e.preventDefault(); cmd("mark"); }
++      if (e.key === "r" || e.key === "R") rotate("a");
++      else if (e.key === "t" || e.key === "T") rotate("b");
++      else if (e.code === "Space") { e.preventDefault(); cmd("mark"); }
 +      else if (e.key === "y" || e.key === "Y") post("cmd/confirm/yes");
 +      else if (e.key === "n" || e.key === "N") post("cmd/confirm/no");
 +    };
@@ -4071,6 +4080,8 @@ index 0000000..b68eaa3
 +          <div className={`g-chip ${mk[0]}`}>iPhone · {mk[1]}</div>
 +          <div className={`g-chip ${am[0]}`}>Android · {am[1]}</div>
 +          <div className="g-line"><span>Phone tracking</span><span>{s.tracking}</span></div>
++          <button className="g-btn" onClick={() => rotate("a")}>Rotate iPhone view <kbd>R</kbd></button>
++          <button className="g-btn" onClick={() => rotate("b")}>Rotate Android view <kbd>T</kbd></button>
 +          <button className="g-btn" onClick={() => cmd("redetect")} disabled={!!s.locked}>Re-detect tower</button>
 +          <button className={`g-btn ${s.locked ? "g-green" : "g-blue"}`} onClick={() => post(s.locked ? "cmd/lock/off" : "cmd/lock/on")}>
 +            {s.locked ? "Overlay locked · click to unlock" : "Lock overlay when it looks right"}
