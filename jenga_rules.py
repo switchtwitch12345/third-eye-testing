@@ -100,3 +100,25 @@ def explain(layers, removed, margin=MARGIN):
 def removable(layers, removed, margin=MARGIN):
     """(layer, slot) -> True if that block may be pulled."""
     return {k: v[0] for k, v in explain(layers, removed, margin).items()}
+
+
+def effective_tower(layers, pulls, placed=True):
+    """The tower after every pulled block has been put back on top, as the real game goes.
+
+    `pulls` = (layer, slot) in the order they were pulled.  Each goes onto the top layer if that has a free slot (lowest slot
+    first), otherwise it starts a new layer above.  Returns (layers, removed): the layer count and every empty (layer, slot),
+    which is what `removable()` wants.  With placed=False the pulled blocks are simply gone (blocks only ever removed)."""
+    present = {(l, s) for l in range(layers) for s in range(3)}
+    top = layers - 1
+    for l, s in pulls:
+        present.discard((int(l), int(s)))
+        if not placed:
+            continue
+        free = [sl for sl in range(3) if (top, sl) not in present]
+        if free:
+            present.add((top, free[0]))
+        else:
+            top += 1
+            present.add((top, 0))
+    n = (top + 1) if placed else layers
+    return n, sorted((l, s) for l in range(n) for s in range(3) if (l, s) not in present)

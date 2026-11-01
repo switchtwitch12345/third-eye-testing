@@ -38,9 +38,13 @@ def _norm(g):
     return (g - g.mean()) / (g.std() + 1e-3)
 
 
-def slots_for_positions(R, t, K, layers):
-    """{layer: {'left': slot, 'middle': slot, 'right': slot}} as seen in the (upright) iPhone picture."""
+def slots_for_positions(R, t, K, layers, rot=0):
+    """{layer: {'left': slot, 'middle': slot, 'right': slot}} as seen in the iPhone picture AS THE PLAYER SEES IT:
+    `rot` is how far the viewer has turned that picture (0, 90, 180 or 270 degrees clockwise), so "left" is left on
+    the player's screen, not left in the phone's own frame."""
     cam = -R.T @ t
+    a = np.radians(rot)
+    ca, sa = float(np.cos(a)), float(np.sin(a))
     out = {}
     for layer in range(layers):
         xs = []
@@ -53,7 +57,8 @@ def slots_for_positions(R, t, K, layers):
                 if best is None or cos > best[0]:
                     best = (cos, c)
             uvw = (best[1] @ R.T + t) @ K.T
-            xs.append(uvw[0] / uvw[2])
+            du, dv = uvw[0] / uvw[2] - K[0, 2], uvw[1] / uvw[2] - K[1, 2]
+            xs.append(du * ca - dv * sa)                   # horizontal position on the turned picture
         order = np.argsort(xs)
         out[layer] = {"left": int(order[0]), "middle": int(order[1]), "right": int(order[2])}
     return out
@@ -105,16 +110,21 @@ def _change(a, b):
     return float(np.abs(a[cy0:cy1, cx0:cx1] - al[cy0:cy1, cx0:cx1]).mean()), (dx, dy)
 
 
-def block_scores(run_dir, mark_ms, prev_mark_ms, start_ms, settle=0.8, after=4.5, use_sides=True):
+def block_scores(run_dir, mark_ms, prev_mark_ms, start_ms, settle=0.8, after=4.5, use_sides=True, a_window=None, b_window=None):
     """{(layer, slot): z} for EVERY block seen both before and after the tap: how strongly its picture changed.
     Same measure as infer() uses (best face per camera, averaged over the cameras that saw it)."""
     rows = _rows(run_dir)
     a_lo = (prev_mark_ms + 1000) if prev_mark_ms else (start_ms + 500)
     a_hi = min(a_lo + 3500, mark_ms - 2000)
-    if a_hi - a_lo < 1500:
+    if a_window is not None:
+        a_lo, a_hi = a_window
+    elif a_hi - a_lo < 1500:
         return None
     A = _window_means(run_dir, rows, a_lo, a_hi)
-    B = _window_means(run_dir, rows, mark_ms + settle * 1000, mark_ms + after * 1000)
+    if b_window is not None:
+        B = _window_means(run_dir, rows, b_window[0], b_window[1])
+    else:
+        B = _window_means(run_dir, rows, mark_ms + settle * 1000, mark_ms + after * 1000)
     common = sorted(k for k in set(A) & set(B) if use_sides or k[4] == "end")
     if len(common) < 10:
         return None
@@ -131,7 +141,8 @@ def block_scores(run_dir, mark_ms, prev_mark_ms, start_ms, settle=0.8, after=4.5
     return {b: (float(np.mean(list(c.values()))) if len(c) >= 2 else max(c.values()) - 2.0) for b, c in per.items()}
 
 
-def infer(run_dir, mark_ms, prev_mark_ms, start_ms, pos, slots, candidates, settle=0.8, after=4.5, use_sides=True):
+def infer(run_dir, mark_ms, prev_mark_ms, start_ms, pos, slots, candidates, settle=0.8, after=4.5, use_sides=True,
+          a_window=None, b_window=None):
     """
     pos        'left' | 'middle' | 'right'
     slots      slots_for_positions(...) output
@@ -143,12 +154,18 @@ def infer(run_dir, mark_ms, prev_mark_ms, start_ms, pos, slots, candidates, sett
         return {"ok": False, "reason": "no face crops yet (is data capture ON?)"}
     a_lo = (prev_mark_ms + 1000) if prev_mark_ms else (start_ms + 500)
     a_hi = min(a_lo + 3500, mark_ms - 2000)
-    if prev_mark_ms and a_hi - a_lo < 1500:
-        return {"ok": False, "reason": "this tap came too soon after the previous one to see the tower before the move"}
-    if a_hi - a_lo < 1500:
-        return {"ok": False, "reason": "no calm intact-tower period before the first move"}
+    if a_window is None:
+        if prev_mark_ms and a_hi - a_lo < 1500:
+            return {"ok": False, "reason": "this tap came too soon after the previous one to see the tower before the move"}
+        if a_hi - a_lo < 1500:
+            return {"ok": False, "reason": "no calm intact-tower period before the first move"}
+    else:
+        a_lo, a_hi = a_window                                   # the calm stretch just before the hand came
     A = _window_means(run_dir, rows, a_lo, a_hi)
-    B = _window_means(run_dir, rows, mark_ms + settle * 1000, mark_ms + after * 1000)
+    if b_window is not None:                                    # the first calm stretch after the hand left
+        B = _window_means(run_dir, rows, b_window[0], b_window[1])
+    else:
+        B = _window_means(run_dir, rows, mark_ms + settle * 1000, mark_ms + after * 1000)
     common = sorted(k for k in set(A) & set(B) if use_sides or k[4] == "end")
     if len(common) < 10:
         return {"ok": False, "reason": f"only {len(common)} faces seen both before and after (hand in the way?)"}
@@ -196,8 +213,59 @@ def infer(run_dir, mark_ms, prev_mark_ms, start_ms, pos, slots, candidates, sett
             "runner_up": second["layer"], "runner_up_z": second["z"],
             "gap": best["z"] - second["z"], "faces_compared": len(common),
             "confident": bool(best["z"] >= 3.0 and best["z"] - second["z"] >= 2.0),
+            "confidence_pct": confidence_pct(best["z"], best["z"] - second["z"]),
             "top": [{"layer": s["layer"], "z": round(s["z"], 2)} for s in ranked[:4]],
             "detail": {s["layer"]: s["by_cam"] for s in ranked}}
+
+
+# How often the finder's answer was right, by how strongly it stood out: measured on every move with a known layer
+# (57 moves in 12 games: the player's corrections, plus answers it was confident about and the player never corrected).
+CONFIDENCE_TIERS = ((10.0, 5.0, 92), (8.0, 4.0, 89), (5.0, 3.0, 85), (3.0, 2.0, 82))     # (min score, min gap to 2nd, % right)
+CONFIDENCE_LOW = 44                                                                       # below the weakest tier
+
+
+def confidence_pct(z, gap):
+    """About how likely the answer is to be exactly right, from how that kind of answer did in past games."""
+    for zmin, gmin, pct in CONFIDENCE_TIERS:
+        if z >= zmin and gap >= gmin:
+            return pct
+    return CONFIDENCE_LOW
+
+
+# The same measurement when the player does NOT say which column: the best block anywhere, and how far ahead of the best block
+# of any OTHER layer it is.  57 moves in 12 games (layer exactly right): z>=12 gap>=6 -> 95%, z>=10 gap>=5 -> 91%, z>=8 gap>=4 -> 88%,
+# z>=6 gap>=3 -> 84%, anything weaker about 50%.  Every answer in the top tiers was within one layer of the truth.
+FREE_TIERS = ((12.0, 6.0, 95), (10.0, 5.0, 91), (8.0, 4.0, 88), (6.0, 3.0, 84))
+FREE_LOW = 50
+
+
+def free_confidence_pct(z, gap):
+    for zmin, gmin, pct in FREE_TIERS:
+        if z >= zmin and gap >= gmin:
+            return pct
+    return FREE_LOW
+
+
+def infer_free(run_dir, mark_ms, prev_mark_ms, start_ms, candidates, a_window=None, b_window=None, settle=0.8, after=2.5):
+    """Which block was pulled, without being told the column?  `candidates` = {(layer, slot)} that could have been pulled
+    (blocks that are there and may legally be pulled).  Returns a dict like infer(): ok, layer (1-based), slot, z, gap,
+    confidence_pct, runner_up, top."""
+    sc = block_scores(run_dir, mark_ms, prev_mark_ms, start_ms, settle=settle, after=after, a_window=a_window, b_window=b_window)
+    if not sc:
+        return {"ok": False, "reason": "too few faces seen both before and after (hand in the way, or data capture was off)"}
+    sc = {k: v for k, v in sc.items() if k in candidates}
+    if len(sc) < 3:
+        return {"ok": False, "reason": "too few of the blocks that could have been pulled were visible"}
+    ranked = sorted(sc.items(), key=lambda kv: -kv[1])
+    (l1, s1), z1 = ranked[0]
+    other = [z for (l, s), z in ranked[1:] if l != l1]
+    z2 = max(other) if other else -5.0
+    second_layer = next((l for (l, s), z in ranked[1:] if l != l1), None)
+    gap = z1 - z2
+    pct = free_confidence_pct(z1, gap)
+    return {"ok": True, "layer": l1 + 1, "slot": int(s1), "z": float(z1), "gap": float(gap), "confidence_pct": pct,
+            "runner_up": (second_layer + 1) if second_layer is not None else None, "runner_up_z": float(z2),
+            "top": [{"layer": l + 1, "slot": int(s), "z": round(float(z), 1)} for (l, s), z in ranked[:4]]}
 
 
 def parse_text(text):

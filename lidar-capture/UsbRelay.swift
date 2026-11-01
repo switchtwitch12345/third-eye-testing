@@ -43,7 +43,18 @@ final class UsbRelay {
                 return
             }
             l.newConnectionHandler = { c in self.accept(c) }
-            l.stateUpdateHandler = { state in print("🔌 USB relay \(state)") }
+            l.stateUpdateHandler = { state in
+                print("🔌 USB relay \(state)")
+                switch state {
+                case .failed, .cancelled:      // iOS closes the socket while the app is away: listen again, don't stay deaf
+                    self.q.async {
+                        self.listener = nil
+                        self.q.asyncAfter(deadline: .now() + 1.0) { self.start() }
+                    }
+                default:
+                    break
+                }
+            }
             l.start(queue: self.q)
             self.listener = l
         }

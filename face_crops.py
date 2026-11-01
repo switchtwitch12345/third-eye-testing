@@ -27,6 +27,11 @@ MIN_COS = 0.20            # skip faces seen almost edge-on
 DET = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))
 
 
+def _distort(uv, K, dist):
+    import tower_points as tp
+    return tp.distort_px(uv, K, dist)
+
+
 def face_geometry(layer, slot, sign):
     """Corners (TL,TR,BR,BL as seen from outside), centre and outward normal, tower frame, mm."""
     z = HEIGHT * (layer + 0.5)
@@ -70,7 +75,7 @@ def side_geometry(layer, slot, sign):
     return np.array([c - r * w + up * h, c + r * w + up * h, c + r * w - up * h, c - r * w - up * h]), c, n
 
 
-def crops_for_frame(img, K, R, t, layers=MAX_LAYERS):
+def crops_for_frame(img, K, R, t, layers=MAX_LAYERS, dist=None):
     """-> list of (layer, slot, sign, cos, crop_bgr) for faces the camera sees properly."""
     h, w = img.shape[:2]
     cam = -R.T @ t
@@ -86,7 +91,7 @@ def crops_for_frame(img, K, R, t, layers=MAX_LAYERS):
                 uvw = (corners @ R.T + t) @ K.T
                 if (uvw[:, 2] <= 0).any():
                     continue
-                uv = (uvw[:, :2] / uvw[:, 2:3]).astype(np.float32)
+                uv = _distort(uvw[:, :2] / uvw[:, 2:3], K, dist).astype(np.float32)
                 if uv[:, 0].min() < 0 or uv[:, 1].min() < 0 or uv[:, 0].max() >= w or uv[:, 1].max() >= h:
                     continue
                 M = cv2.getPerspectiveTransform(uv, DST)
@@ -94,7 +99,7 @@ def crops_for_frame(img, K, R, t, layers=MAX_LAYERS):
     return out
 
 
-def side_crops_for_frame(img, K, R, t, layers=MAX_LAYERS):
+def side_crops_for_frame(img, K, R, t, layers=MAX_LAYERS, dist=None):
     """-> list of (layer, slot, sign, cos, crop_bgr) for outer blocks' long side faces seen well enough."""
     h, w = img.shape[:2]
     cam = -R.T @ t
@@ -113,7 +118,7 @@ def side_crops_for_frame(img, K, R, t, layers=MAX_LAYERS):
             uvw = (corners @ R.T + t) @ K.T
             if (uvw[:, 2] <= 0).any():
                 continue
-            uv = (uvw[:, :2] / uvw[:, 2:3]).astype(np.float32)
+            uv = _distort(uvw[:, :2] / uvw[:, 2:3], K, dist).astype(np.float32)
             if uv[:, 0].min() < 0 or uv[:, 1].min() < 0 or uv[:, 0].max() >= w or uv[:, 1].max() >= h:
                 continue
             M = cv2.getPerspectiveTransform(uv, DST_SIDE)
@@ -121,7 +126,7 @@ def side_crops_for_frame(img, K, R, t, layers=MAX_LAYERS):
     return out
 
 
-def solve_pose(img, K, dist=None):
+def solve_pose(img, K, dist=None, corrected=True):
     """(R, t, reproj) from the markers, or None.  Needs 3+ markers."""
     import tower_points as tp
     g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
@@ -131,7 +136,7 @@ def solve_pose(img, K, dist=None):
     d = {int(i): c.reshape(4, 2).astype(np.float64) for c, i in zip(corners, ids.flatten()) if int(i) < 4}
     if dist is not None and len(dist):
         d = {i: cv2.undistortPoints(c.reshape(-1, 1, 2), K, dist, P=K).reshape(4, 2) for i, c in d.items()}
-    s = tp.solve(d, K, layout=tp.LAYOUTS["A"])
+    s = tp.solve(d, K, layout=tp.LAYOUTS["A"], corrected=corrected)
     return s if (s and s[2] <= 7.0) else None
 
 
@@ -159,17 +164,111 @@ def iphone_K(meta, w):
     return np.array([[meta["fx"] * s, 0, meta["cx"] * s], [0, meta["fy"] * s, meta["cy"] * s], [0, 0, 1.0]])
 
 
+def write_frame(out, q, t0, cam, ts, img, K, pose, src, layers, dist=None):
+    """Cut every face and side of one frame to disk; returns the index rows."""
+    R, t, err = pose
+    rows = []
+    base = {"cam": cam, "ts_ms": int(ts), "t_sec": round((int(ts) - t0) / 1000, 2)}
+    for layer, slot, sign, cos, crop in crops_for_frame(img, K, R, t, layers, dist):
+        fn = f"{cam}/{ts}_L{layer}_S{slot}_{'p' if sign > 0 else 'm'}.jpg"
+        path = os.path.join(out, fn)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        cv2.imwrite(path, crop, [cv2.IMWRITE_JPEG_QUALITY, q])
+        rows.append(dict(base, layer=layer, slot=slot, sign=sign, cos=round(cos, 3), pose_src=src, reproj=round(err, 2), file=fn))
+    for layer, slot, sign, cos, crop in side_crops_for_frame(img, K, R, t, layers, dist):
+        fn = f"{cam}/{ts}_L{layer}_S{slot}_{'p' if sign > 0 else 'm'}_side.jpg"
+        cv2.imwrite(os.path.join(out, fn), crop, [cv2.IMWRITE_JPEG_QUALITY, q])
+        rows.append(dict(base, layer=layer, slot=slot, sign=sign, cos=round(cos, 3), kind="side", pose_src=src, reproj=round(err, 2), file=fn))
+    return rows
+
+
+def process_frame(job):
+    """One saved frame -> crops on disk + index rows.  Runs inside a worker process (crop_worker.py), so the live server's
+    own threads are not slowed down by it and it is not slowed down by them."""
+    import tower_points as tp
+    if job.get("corr"):
+        tp.set_correction(np.array(job["corr"][0]), np.array(job["corr"][1]))
+    img = cv2.imread(job["path"])
+    if img is None:
+        return {"cam": job["cam"], "ts": job["ts"], "skip": "unreadable"}
+    if job["cam"] == "iphone":
+        try:
+            meta = json.load(open(job["meta"]))
+        except Exception:
+            return {"cam": job["cam"], "ts": job["ts"], "skip": "no intrinsics"}
+        K, dist = iphone_K(meta, img.shape[1]), None
+    else:
+        K, dist = android_K(img.shape[1], img.shape[0])
+        if K is None:
+            return {"cam": job["cam"], "ts": job["ts"], "skip": "no lens"}
+    pose = solve_pose(img, K, dist, corrected=(job["cam"] == "iphone"))   # the LiDAR fit belongs to the iPhone's pose only
+    src = "marker"
+    if pose is not None and job.get("delta"):
+        import tower_edges as te                 # the overlay was snapped to the tower outline: cut the crops there too
+        R_, t_ = te.apply_delta(pose[0], pose[1], np.array(job["delta"]))
+        pose = (R_, t_, pose[2])
+    if pose is None:
+        fb = job.get("fallback")
+        if fb is None:
+            return {"cam": job["cam"], "ts": job["ts"], "skip": "no pose"}
+        pose, src = (np.array(fb[0]), np.array(fb[1]), fb[2]), "carried"
+    rows = write_frame(job["out"], job["q"], job["t0"], job["cam"], job["ts"], img, K, pose, src, job["layers"], dist)
+    return {"cam": job["cam"], "ts": job["ts"], "rows": rows,
+            "pose": [np.asarray(pose[0]).tolist(), np.asarray(pose[1]).tolist(), float(pose[2])] if src == "marker" else None}
+
+
+class CropPool:
+    """A few crop_worker.py processes, each cutting whole frames.  run(jobs) returns the results in order."""
+
+    def __init__(self, n=3):
+        import subprocess
+        self.procs = [subprocess.Popen([sys.executable, os.path.join(HERE, "crop_worker.py")], stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, text=True, bufsize=1) for _ in range(max(1, n))]
+
+    def _batch(self, proc, jobs):
+        try:
+            for j in jobs:
+                proc.stdin.write(json.dumps(j) + "\n")
+            proc.stdin.flush()
+            return [json.loads(proc.stdout.readline() or "null") for _ in jobs]
+        except Exception:
+            return [None] * len(jobs)
+
+    def run(self, jobs):
+        from concurrent.futures import ThreadPoolExecutor
+        if not jobs:
+            return []
+        parts = [jobs[i::len(self.procs)] for i in range(len(self.procs))]
+        with ThreadPoolExecutor(len(self.procs)) as ex:
+            outs = list(ex.map(self._batch, self.procs, parts))
+        res = [None] * len(jobs)
+        for i, o in enumerate(outs):
+            for k, r in enumerate(o):
+                res[i + k * len(self.procs)] = r
+        return res
+
+    def close(self):
+        for p in self.procs:
+            try:
+                p.stdin.close()
+                p.terminate()
+            except Exception:
+                pass
+
+
 class DatasetWriter:
     """Incrementally turns a capture folder into crops + index.jsonl.  Safe to call step() repeatedly."""
 
-    def __init__(self, src, out, stride=2, since_ms=0, until_ms=None, jpeg_quality=88):
+    def __init__(self, src, out, stride=2, since_ms=0, until_ms=None, jpeg_quality=88, workers=0):
         self.src, self.out, self.stride = src, out, max(1, stride)
+        self.pool = CropPool(workers) if workers else None
         self.since, self.until, self.q = since_ms, until_ms, jpeg_quality
         self.done = set()
         self.last_pose = {"iphone": None, "android": None}
         self.counts = {"frames": 0, "crops": 0, "skipped_no_pose": 0}
         self.t0 = None
         self.layers = MAX_LAYERS            # the viewer keeps this equal to the tower's real height
+        self.deltas = {}                     # camera -> tower_edges parameters (list of 6), set by the server
         os.makedirs(out, exist_ok=True)
         self.index = open(os.path.join(out, "index.jsonl"), "a")
 
@@ -180,9 +279,9 @@ class DatasetWriter:
         for f in glob.glob(f"{self.src}/*_android.jpg"):
             self.done.add("a" + os.path.basename(f).split("_")[0])
 
-    def _write(self, cam, ts, img, K, pose, src):
+    def _write(self, cam, ts, img, K, pose, src, dist=None):
         R, t, err = pose
-        for layer, slot, sign, cos, crop in crops_for_frame(img, K, R, t, self.layers):
+        for layer, slot, sign, cos, crop in crops_for_frame(img, K, R, t, self.layers, dist):
             fn = f"{cam}/{ts}_L{layer}_S{slot}_{'p' if sign > 0 else 'm'}.jpg"
             path = os.path.join(self.out, fn)
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -191,7 +290,7 @@ class DatasetWriter:
                                          "layer": layer, "slot": slot, "sign": sign, "cos": round(cos, 3),
                                          "pose_src": src, "reproj": round(err, 2), "file": fn}) + "\n")
             self.counts["crops"] += 1
-        for layer, slot, sign, cos, crop in side_crops_for_frame(img, K, R, t, self.layers):
+        for layer, slot, sign, cos, crop in side_crops_for_frame(img, K, R, t, self.layers, dist):
             fn = f"{cam}/{ts}_L{layer}_S{slot}_{'p' if sign > 0 else 'm'}_side.jpg"
             path = os.path.join(self.out, fn)
             cv2.imwrite(path, crop, [cv2.IMWRITE_JPEG_QUALITY, self.q])
@@ -202,7 +301,7 @@ class DatasetWriter:
         self.counts["frames"] += 1
 
     def _pose(self, cam, img, K, dist):
-        s = solve_pose(img, K, dist)
+        s = solve_pose(img, K, dist, corrected=(cam == "iphone"))
         if s:
             self.last_pose[cam] = s
             return s, "marker"
@@ -210,8 +309,55 @@ class DatasetWriter:
             return self.last_pose[cam], "carried"
         return None, None
 
+    def _step_pool(self):
+        """Same frames as step(), cut by the worker processes (stride 1 only)."""
+        import tower_points as tp
+        corr = [x.tolist() for x in tp.get_correction()]
+        layers = int(self.layers)
+        jobs = []
+        for f in glob.glob(f"{self.src}/*_rgb.jpg"):
+            ts = os.path.basename(f).split("_")[0]
+            if ts in self.done or int(ts) < self.since or (self.until and int(ts) > self.until):
+                continue
+            mp = f"{self.src}/{ts}_intrinsics.json"
+            if not os.path.exists(mp):
+                continue
+            jobs.append(("iphone", ts, f, mp))
+        for f in glob.glob(f"{self.src}/*_android.jpg"):
+            ts = os.path.basename(f).split("_")[0]
+            if "a" + ts in self.done or int(ts) < self.since or (self.until and int(ts) > self.until):
+                continue
+            jobs.append(("android", ts, f, None))
+        jobs.sort(key=lambda j: int(j[1]))
+        if jobs and self.t0 is None:
+            self.t0 = int(jobs[0][1])
+        todo = [{"cam": c, "ts": ts, "path": p, "meta": m, "out": self.out, "q": self.q, "t0": self.t0, "layers": layers,
+                 "corr": corr, "delta": self.deltas.get(c), "fallback": ([self.last_pose[c][0].tolist(), self.last_pose[c][1].tolist(), float(self.last_pose[c][2])]
+                                            if self.last_pose[c] is not None else None)} for c, ts, p, m in jobs]
+        n = 0
+        for job, res in zip(todo, self.pool.run(todo)):
+            self.done.add(job["ts"] if job["cam"] == "iphone" else "a" + job["ts"])
+            if not res:
+                continue
+            if res.get("skip"):
+                if res["skip"] == "no pose":
+                    self.counts["skipped_no_pose"] += 1
+                continue
+            for row in res["rows"]:
+                self.index.write(json.dumps(row) + "\n")
+            self.counts["crops"] += len(res["rows"])
+            self.counts["frames"] += 1
+            if res.get("pose"):
+                p = res["pose"]
+                self.last_pose[job["cam"]] = (np.array(p[0]), np.array(p[1]), p[2])
+            n += 1
+        self.index.flush()
+        return n
+
     def step(self, limit=None):
         """Process new complete frames.  Returns number processed."""
+        if self.pool is not None and self.stride == 1:
+            return self._step_pool()
         n = 0
         stamps = sorted(os.path.basename(f).split("_")[0] for f in glob.glob(f"{self.src}/*_rgb.jpg"))
         for i, ts in enumerate(stamps):
@@ -264,10 +410,12 @@ class DatasetWriter:
             if pose is None:
                 self.counts["skipped_no_pose"] += 1
                 continue
-            self._write("android", ts, img, K, pose, src)
+            self._write("android", ts, img, K, pose, src, dist)
             n += 1
         self.index.flush()
         return n
 
     def close(self):
         self.index.close()
+        if self.pool is not None:
+            self.pool.close()

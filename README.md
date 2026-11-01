@@ -147,6 +147,8 @@ Optional. The phones work over Wi-Fi exactly as before; with a cable the picture
   The native app (`android-capture/`) checks `127.0.0.1:8000` once a second; while the game server answers there it sends
   everything over the cable, the IP box turns green and the status says `🔌 USB`. Unplug (or no `adb reverse`) and it is
   back on the typed Wi-Fi IP within 3 s. Re-run `scripts/wired.sh` after replugging: `adb reverse` does not survive it.
+  `scripts/wired_auto.sh` does both phones hands-off: it re-applies `adb reverse` whenever the Android phone is plugged in
+  and runs the iPhone bridge, so you just plug in and play (Wi-Fi is used for any phone without a cable).
 
 ## Notes
 * Recordings and the dataset are deliberately not in this repo (large; they show people). `docs/` has tower-only figures.

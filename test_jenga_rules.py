@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Checks the pull rules against cases worked out by hand.   .venv/bin/python test_jenga_rules.py"""
 from jenga_rules import removable
+import jenga_rules as jr
 
 L, M, R = 0, 1, 2
 N = 9
@@ -42,3 +43,15 @@ assert ok(lean, (1, L))                      # near the bottom, balanced enough:
 assert not ok([(1, L), (1, M)], (1, R))
 assert not ok([], (N - 1, M))
 print("all rule checks passed")
+
+
+# --- blocks put back on top ----------------------------------------------------------------------------------
+n, rem = jr.effective_tower(8, [(3, 0)])
+assert n == 9 and (8, 0) not in rem and (8, 1) in rem and (8, 2) in rem and (3, 0) in rem, (n, rem)   # one pulled block starts layer 9
+n, rem = jr.effective_tower(8, [(3, 0), (4, 2), (2, 1)])
+assert n == 9 and {(l, s) for l in range(9) for s in range(3)} - set(rem) >= {(8, 0), (8, 1), (8, 2)}, (n, rem)   # three pulls fill it
+n, rem = jr.effective_tower(8, [(3, 0)], placed=False)
+assert n == 8 and rem == [(3, 0)], (n, rem)
+pullable = jr.removable(*jr.effective_tower(8, [(3, 0)]))
+assert all(not pullable.get((8, s), False) for s in range(3)), "the new partial top layer must never be pullable"
+print("blocks-put-back-on-top checks passed")

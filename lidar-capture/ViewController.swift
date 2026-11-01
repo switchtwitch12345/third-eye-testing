@@ -39,6 +39,7 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     let sessionID = UUID().uuidString  // new value each app launch — frames from different launches don't share a world origin
 
     var macServerURL = "http://10.16.40.91:8000/upload"
+    var arConfig: ARWorldTrackingConfiguration?          // kept so the session can be restarted after an interruption
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -137,6 +138,14 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
         // Configure AR
         let config = ARWorldTrackingConfiguration()
         config.frameSemantics = [.sceneDepth]  // Use array syntax
+        arConfig = config
+        
+        // The phone sits on a stand and nobody touches it: never let the screen lock (a locked phone suspends the app, the
+        // camera and the network, which looked like the app going into standby), and pick everything up again whenever the
+        // app comes back to the front.
+        UIApplication.shared.isIdleTimerDisabled = true
+        NotificationCenter.default.addObserver(self, selector: #selector(appBecameActive),
+                                               name: UIApplication.didBecomeActiveNotification, object: nil)
         
         print("✅ Starting AR session...")
         sceneView.session.run(config)
@@ -353,9 +362,8 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
     
     func session(_ session: ARSession, didFailWithError error: Error) {
         print("❌ AR SESSION FAILED: \(error.localizedDescription)")
-        DispatchQueue.main.async {
-            self.showAlert(message: "AR failed: \(error.localizedDescription)")
-        }
+        // try again on its own a moment later instead of leaving a dead camera that only a rebuild would bring back
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.restartSession(reset: true) }
     }
     
     func sessionWasInterrupted(_ session: ARSession) {
@@ -373,6 +381,32 @@ class ViewController: UIViewController, ARSCNViewDelegate, ARSessionDelegate {
 
     func sessionInterruptionEnded(_ session: ARSession) {
         print("✅ Session resumed — capture stays paused, tap START when ready")
+        restartSession(reset: true)
+    }
+
+    /// Back in front (after the screen was locked, another app, a call): the screen stays awake again, the USB relay listens
+    /// again (iOS closes its socket while the app is away), and the camera session is running.
+    @objc func appBecameActive() {
+        UIApplication.shared.isIdleTimerDisabled = true
+        UsbRelay.shared.start()
+        let tracking = sceneView.session.currentFrame?.camera.trackingState
+        if sceneView.session.currentFrame == nil {
+            restartSession(reset: false)
+        } else if case .notAvailable? = tracking {
+            restartSession(reset: true)
+        }
+    }
+
+    func restartSession(reset: Bool) {
+        guard let config = arConfig else { return }
+        DispatchQueue.main.async {
+            if reset {
+                self.sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+            } else {
+                self.sceneView.session.run(config)
+            }
+            self.statusLabel.text = "✅ Camera restarted\nTap START when ready"
+        }
     }
 
     // MARK: - Remote control from the Mac viewer (so nobody has to touch the phone)

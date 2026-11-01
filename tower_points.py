@@ -31,6 +31,12 @@ _BASE = None         # (positions, yaws) of the markers before any such turn
 _MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "marker_map.json")
 
 
+CORNERS = {}         # id -> 4x3 corners (tower frame, mm) from calibrate_board.py; empty = flat squares from the layout
+CENTRE_Z = {}        # id -> height of the marker centre above the tower frame's floor
+FIXED = False        # the board was calibrated once and is permanent: the per-game marker measurement is skipped
+_BASE_CORNERS = None
+
+
 def _apply_rotation(k):
     """Re-express the marker layout in a tower frame turned by -90 degrees k times. Edits in place so every
     module that already holds LAYOUTS["A"] sees the change."""
@@ -42,18 +48,29 @@ def _apply_rotation(k):
     TOWER_ROT = k % 4
     LAYOUTS["A"].clear(); LAYOUTS["A"].update(pos)
     MARKER_YAW.clear(); MARKER_YAW.update(yaw)
+    CORNERS.clear(); CENTRE_Z.clear()
+    for i, c in (_BASE_CORNERS or {}).items():
+        c = np.array(c, float)
+        for _ in range(k % 4):
+            c = np.stack([c[:, 1], -c[:, 0], c[:, 2]], axis=1)
+        CORNERS[i] = c
+        CENTRE_Z[i] = float(c[:, 2].mean())
 
 
 def _load_marker_map():
     """marker_map.json (from calibrate_markers.py) overrides the nominal square. MARKER_MAP=off ignores it."""
-    global _BASE
+    global _BASE, _BASE_CORNERS, FIXED
     rot = 0
+    _BASE_CORNERS, FIXED = None, False
     if os.environ.get("MARKER_MAP") != "off" and os.path.exists(_MAP_PATH):
         j = json.load(open(_MAP_PATH))
         m = j["markers"]
         _BASE = ({int(k): (float(v["x"]), float(v["y"])) for k, v in m.items()},
                  {int(k): float(v["yaw"]) for k, v in m.items()})
         rot = int(j.get("tower_rot90", 0))
+        if j.get("corners"):
+            _BASE_CORNERS = {int(k): v for k, v in j["corners"].items()}
+        FIXED = bool(j.get("fixed"))
     else:
         _BASE = (dict(LAYOUTS["A"]), {i: 0.0 for i in LAYOUTS["A"]})
     _apply_rotation(rot)
@@ -83,7 +100,25 @@ DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 DETECTOR = cv2.aruco.ArucoDetector(DICT)
 
 
+def distort_px(uv, K, dist):
+    """Where the lens really puts points that an ideal (pinhole) camera would put at `uv` (OpenCV's model).  Poses are solved
+    from corners that were undistorted, so anything drawn or cut on the raw picture has to be bent back the same way."""
+    if dist is None or len(dist) < 4 or not np.any(dist):
+        return uv
+    k1, k2, p1, p2 = [float(x) for x in dist[:4]]
+    k3 = float(dist[4]) if len(dist) > 4 else 0.0
+    x = (uv[:, 0] - K[0, 2]) / K[0, 0]
+    y = (uv[:, 1] - K[1, 2]) / K[1, 1]
+    r2 = x * x + y * y
+    rad = 1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
+    xd = x * rad + 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
+    yd = y * rad + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
+    return np.stack([xd * K[0, 0] + K[0, 2], yd * K[1, 1] + K[1, 2]], axis=1)
+
+
 def marker_corners_3d(mid, rot, layout=None):
+    if mid in CORNERS:                            # a calibrated board: every corner has its measured 3-D position
+        return np.roll(CORNERS[mid], -rot, axis=0).copy()
     cx, cy = (layout or CENTRES)[mid]
     h = MARKER_MM / 2
     base = [(-h, h), (h, h), (h, -h), (-h, -h)]  # TL TR BR BL, marker "up" = +y
@@ -127,9 +162,17 @@ def detect(rgb):
 _CORR = (np.eye(3), np.zeros(3))      # replaced as one tuple, so a thread solving a pose never sees half of a swap
 
 
+_CORR_VER = 0                       # counts changes, so a fit made against an old correction can be recognised as stale
+
+
+def corr_version():
+    return _CORR_VER
+
+
 def set_correction(R, t):
-    global _CORR
+    global _CORR, _CORR_VER
     _CORR = (np.asarray(R, float).copy(), np.asarray(t, float).copy())
+    _CORR_VER += 1
 
 
 def get_correction():
@@ -146,14 +189,14 @@ def _corrected(R, t):
     return R @ Rc, t + R @ tc
 
 
-def solve(dets, K, rot=None, layout=None):
+def solve(dets, K, rot=None, layout=None, corrected=True):
     """Pose of tower frame in camera. Stage 1 uses marker centres only (independent of how
     each marker was rotated); stage 2 refines with corners using the best per-marker rotation."""
     layout = layout or CENTRES
     ids = [i for i in dets if i in layout]
     if len(ids) < 3:
         return None
-    ctr3 = np.array([[*layout[i], 0.0] for i in ids], np.float64)
+    ctr3 = np.array([[*layout[i], CENTRE_Z.get(i, 0.0)] for i in ids], np.float64)
     ctr2 = np.array([dets[i].mean(axis=0) for i in ids], np.float64)
     cands = []                                       # stage-1 poses from the marker centres (possibly several: the fit is ambiguous)
     n, rv, tv, _ = cv2.solvePnPGeneric(ctr3, ctr2, K, None, flags=cv2.SOLVEPNP_IPPE if len(ids) >= 4 else cv2.SOLVEPNP_SQPNP)
@@ -215,7 +258,7 @@ def solve(dets, K, rot=None, layout=None):
             best = (R2, tv2.reshape(3), err)
     if best is None:
         return None
-    R_, t_ = _corrected(best[0], best[1])
+    R_, t_ = _corrected(best[0], best[1]) if corrected else (best[0], best[1])
     return R_, t_, best[2]
 
 
