@@ -1,0 +1,238 @@
+\documentclass[conference,10pt]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{cite}
+\usepackage{url}
+\usepackage{xcolor}
+\graphicspath{{../figures/}}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\TODO}[1]{\textbf{[requires measurement: #1]}}
+
+\begin{document}
+\title{Third Eye: A Phone-Based Referee for Physical Board Games Combining LiDAR Depth, Fiducial Pose, and Compiled Rulebooks}
+\author{\IEEEauthorblockN{Aadit Pani,Megh Mavani,Mitul KM}
+\IEEEauthorblockA{\textit{Third Eye project team}\\ Draft of \today}}
+\maketitle
+
+\begin{abstract}
+We describe Third Eye, a system that watches a physical Jenga game with one or two ordinary phones (one with LiDAR), marks which blocks may legally and safely be pulled, names the block that was pulled, and flags a collapse. The contribution is an engineering study of the system as built, not a new vision algorithm. We trace the frame-acquisition path from the ARKit callback to the rule checker, and describe the changes that made the overlay stable on both cameras: a permanently calibrated marker board, a LiDAR correction applied to the iPhone pose, and snapping of the projected tower to its image outline. We report measurements on three real iPhone games (1{,}706 saved frames), 31 pulls with a known layer, and replays of recorded sessions through the current server. Saved frames arrive at 2.85--3.00\,Hz; each costs 0.78--0.87\,MB. On a laptop CPU the depth path costs about 67\,ms per frame, dominated by a robust 7-DoF fit. A colour-only layer finder is right on 77\,\% of the 31 pulls (94\,\% within one layer); in the current pipeline a calibrated confidence of at least 90\,\% adds the block automatically and the player answers Yes or No, and below that the player types the move. The finder's compute time per move is 0.2--0.3\,s on a Mac. The collapse detector flagged the one real fall in three replayed games and raised no false alarm in the other two. Wired-versus-Wi-Fi frame rate, end-to-end latency, two-camera depth accuracy, and a held-out finder accuracy were not measured; we say so explicitly.
+\end{abstract}
+\begin{IEEEkeywords}
+Jenga, LiDAR, ARKit, ArUco, physical-game refereeing, frame acquisition, rule compilation
+\end{IEEEkeywords}
+
+\section{Introduction}
+Refereeing a physical game needs the state of the pieces and a rulebook. For Jenga the state is a stack of $L$ layers of three blocks; the rules say which block may be pulled and when the game is over. Third Eye targets this with commodity phones. The project began with jigsaw, LEGO and Jenga scenarios; the work reported here is the Jenga path, the only one with real recordings.
+
+We make no claim of a new detector or tracker. The paper (i) documents precisely how frames are acquired and processed, because the cadence and loss behaviour bound everything downstream; (ii) describes how the overlay, the pull finder and the collapse detector were made dependable, including the failures that motivated each guard; and (iii) reports what works and what does not, including a negative result for depth-only pull detection. Section~\ref{sec:measured} separates measured values from derived and unknown ones.
+
+\section{Related Work}
+\textbf{Physical Jenga as a robotics benchmark.} Fazeli et al.\ learn a hierarchical model that fuses force and vision so that a robot can extract blocks without toppling the tower~\cite{fazeli2019}. Their problem is manipulation, with a force-sensing wrist; ours is observing a human game, with no force channel.
+
+\textbf{Marker-based tracking and AR assembly.} Fiducial markers such as ArUco~\cite{garrido2014} supply camera pose for AR guidance, surveyed for assembly in~\cite{wang2016}. We use the same primitive to place the tower in a fixed frame.
+
+\textbf{Procedural-activity understanding.} Assembly101~\cite{sener2022} provides multi-view video of assembly and a mistake-detection task. It targets learned recognition from video; our checker instead evaluates explicit, compiled rules against an occupancy lattice.
+
+\textbf{Phone LiDAR and depth fusion.} Luetzenburg et al.\ report about $\pm1$\,cm absolute accuracy for objects larger than 10\,cm on an iPhone 12 Pro~\cite{luetzenburg2021}; Jenga layers are 15\,mm. Dense fusion systems such as KinectFusion~\cite{newcombe2011} build surface models; our early mesh-fusion scripts were superseded because ARKit's mesh triangles ($\approx$30\,mm, per the capture repository's notes) cannot resolve 15\,mm layers. Hand detection uses MediaPipe Hands~\cite{zhang2020mediapipe} in the live path. Camera calibration follows~\cite{zhang2000}. Phase correlation~\cite{kuglin1975} is used by the capture repository's earlier layer finder.
+
+\begin{table}[t]
+\caption{Comparison with cited work (verifiable properties only).}\label{tab:related}
+\centering\footnotesize
+\begin{tabular}{@{}p{1.5cm}p{1.9cm}p{2.3cm}p{2.3cm}@{}}
+\toprule
+Work & Input & Task & Rules \\
+\midrule
+\cite{fazeli2019} & vision + force, robot & extract blocks & learned model \\
+\cite{sener2022} & multi-view RGB video & recognition, mistake detection & none explicit \\
+\cite{wang2016} & survey of AR assembly & guidance & n/a \\
+Ours & phone RGB + LiDAR, ArUco & pull legality, collapse & compiled spec, balance model \\
+\bottomrule
+\end{tabular}
+\end{table}
+\textbf{What is distinct.} Each component above is existing technology. What this system adds is the integration: a phone-only rig, a pull ledger confirmed by the player that is trusted over noisy depth, an overlay fixed to a calibrated board, and a rule checker driven by a validated spec compiled from a natural-language rulebook. We have not compared performance against any cited system, so no superiority is claimed.
+
+\section{Problem Formulation}
+Let the tower be $L$ layers, each with three slots $s\in\{0,1,2\}$; occupancy $o_{\ell s}\in\{0,1\}$. A move removes one $(\ell,s)$ and places one on top. The referee must output (a) the pulled $(\ell,s)$, (b) for each standing block whether pulling it is allowed, (c) a game-over signal. Constraints: 15\,mm layers, 75\,mm tower width, a handful of seconds between human actions, consumer phones. Frame cadence $f$ and loss rate bound how quickly a state change can be seen.
+
+\section{System Architecture}
+Fig.~\ref{fig:arch} shows the system. An iPhone with LiDAR (ARKit) and optionally an Android phone post frames over HTTP to a Python game server (\code{iphone\_saved.py}), which keeps the pull ledger and sends the browser the raw preview together with a short list of overlay shapes. The Third Eye server follows that ledger (\code{gamelink.py}) and runs the compiled rule checker, collapse detector and LLM explanation panel. Fig.~\ref{fig:internal} details the internal stages. Over a USB cable the phones can use a wired mode (Section~\ref{sec:wired}); without one, everything runs over Wi-Fi unchanged.
+\begin{figure*}[t]\centering
+\includegraphics[width=0.92\textwidth]{fig1_system_architecture.pdf}
+\caption{Overall architecture. Solid arrows carry data; dashed red arrows carry control. (This figure predates the browser-side overlay and the wired mode and should be redrawn.)}\label{fig:arch}
+\end{figure*}
+\begin{figure*}[t]\centering
+\includegraphics[width=0.92\textwidth]{fig3_internal_processing.pdf}
+\caption{Internal processing stages. Dashed red: human input. (Predates the Yes/No confirmation.)}\label{fig:internal}
+\end{figure*}
+
+\section{Frame Acquisition and Processing}
+\subsection{iPhone path}
+The ARKit session callback runs at about 60\,Hz (stated in the source; not measured). Three consumers share it (Fig.~\ref{fig:acq}):
+\begin{enumerate}
+\item \emph{Preview}: every $k_p$-th frame ($k_p=6$ on Wi-Fi, 2 on USB) if fewer than $m$ requests are in flight ($m=1$ on Wi-Fi, 8 on USB). The frame is scaled to 960\,px width, JPEG-encoded at quality 0.6 and posted. Frames arriving while the limit is reached are discarded, never queued.
+\item \emph{Depth}: every $k_d$-th preview ($k_d=5$ or 15) also posts the $256{\times}192$ float32 depth map and 8-bit confidence map, about 2\,Hz in both modes.
+\item \emph{Recording}: while recording, a frame is kept only if tracking is normal and depth is present, and then every 20th qualifying frame is saved: full $1920{\times}1440$ JPEG (quality 0.9), depth, confidence, intrinsics, and the $4{\times}4$ pose.
+\end{enumerate}
+The nominal rates are $f_s=f_a/20$ for saved frames and $f_p\le \min\{f_a/k_p,\;1/(\tau_{\mathrm{rtt}}+\tau_{\mathrm{srv}})\}$ for previews when $m=1$, where $f_a$ is the ARKit rate, $\tau_{\mathrm{rtt}}$ the network round trip and $\tau_{\mathrm{srv}}$ the server handling time. With $f_a=60$\,Hz, $f_s=3$\,Hz. The achieved preview rate was not logged. The app also keeps the screen awake, restarts its AR session and its listener after the app was in the background, so a session survives the phone being picked up and put down.
+\begin{figure*}[t]\centering
+\includegraphics[width=0.92\textwidth]{fig2_frame_acquisition_pipeline.pdf}
+\caption{Frame acquisition and sampling on the iPhone. Three decimation branches share one callback; the figure also records the measured save cadence.}\label{fig:acq}
+\end{figure*}
+\subsection{Android and server}
+The Android app streams $1280{\times}720$ JPEGs over keep-alive HTTP, encoding four frames in parallel, so frames can overtake each other; the server discards a frame whose sequence number is older than the last accepted one. It replies before marker detection, which runs on a single-slot worker that is overwritten by newer frames (latest-wins). Disk saves are rate-limited to 3\,Hz. Overlay drawing is not done on the server: it sends the raw JPEG and a list of shapes (quadrilaterals for blocks, marker outlines, banners) and the browser draws them over the picture. This removes the draw-and-re-encode step from the request handler and puts the drawing on the browser's GPU; it also means labels are drawn upright at the viewer's rotation. Shared state sits behind one global lock; the server is a one-thread-per-connection \code{ThreadingHTTPServer}. Exceptions in depth handling are caught and the reply is always \code{OK}, so a failed depth frame is silently lost.
+\subsection{Wired mode}\label{sec:wired}
+Over a USB cable the Mac can reach the phone but the phone cannot reach the Mac. For the iPhone the app therefore keeps its outgoing requests in a queue, and a small bridge on the Mac (\code{usb\_bridge.py}, through \code{iproxy}) collects them from a port on the phone, plays them to the game server and hands the answers back. While the bridge is collecting, the app uses the cable and raises its rate ($k_p=2$, $m=8$); when the cable goes away it falls back to Wi-Fi with the original rates. For the Android phone, \code{adb reverse} makes the Mac reachable as \code{localhost}, and the camera app switches to it on its own. We did not measure the achieved frame rates of the two modes.
+
+\subsection{Pose, calibrated board and tower fit}
+Four $40$\,mm ArUco markers (\code{DICT\_4X4\_50}) lie around the tower. The pose of the tower frame in the camera comes from \code{solvePnP} on marker centres (IPPE for four markers, SQPnP for three; for three markers 24 seeded iterative solves resolve the ambiguity) followed by corner refinement. The pose is held for up to 6\,s when markers are hidden, and smoothed with an exponential average ($\alpha=0.2$); when the markers have not moved between frames the previous pose is reused, which stops the overlay creeping with pixel noise.
+
+\emph{Fixed board.} The markers are glued to one board and never moved, so their layout is solved once by bundle adjustment over recorded frames and stored (\code{marker\_map.json}: per-marker corner positions and a ``fixed'' flag). Every game then starts from that layout instead of from the nominal printed positions. An Android lens model is calibrated the same way.
+
+\emph{LiDAR correction.} Depth is back-projected with $X=(u-c_x)d/f_x$, $Y=(v-c_y)d/f_y$, $Z=d$ for confidence-2 pixels with $0.05<d<1.5$\,m, then mapped to the tower frame, $P=R^{\top}(X-t)$ (Fig.~\ref{fig:algo}). A 7-parameter fit (shift, rotation vector, height $H$) aligns a $75{\times}75$\,mm box and the board to the points by minimising signed-distance residuals $r_i$ with Geman--McClure weights $w_i=(\sigma^2/(\sigma^2+r_i^2))^2$, $\sigma\in\{30,20,12,8,5\}$\,mm, six Gauss-Newton iterations per level and a numerical Jacobian. The fit's shift and tilt become a correction to the pose. It applies to the iPhone only: the Android camera has no depth, and applying the iPhone's correction to the Android pose put its overlay exactly one layer too high. Layers follow as $n=\mathrm{round}(H/15\,\mathrm{mm})$.
+
+\emph{Edge-snapping.} For each camera the projected tower outline is nudged to the image edges of the tower: a small search over shift and tilt that maximises an edge-alignment score between the projected outline and the image gradients. It runs per camera, per game, and is redone when a phone is moved. A \emph{lock} button freezes the overlay once the player is happy with it.
+\begin{figure}[t]\centering
+\includegraphics[width=\columnwidth]{fig6_algorithmic_workflow.pdf}
+\caption{Mathematical workflow: back-projection, robust box fit, height and collapse, layer finder, balance rule.}\label{fig:algo}
+\end{figure}
+
+\subsection{Pull identification, rules and collapse}
+\emph{Layer finder.} After the player taps MARK, the finder compares end-face crops from a calm window before the tap with a calm window after it. The windows are found from hand and motion activity: a burst of motion or a detected hand ends a window. For each layer $\ell$ and camera $c$, the median $32{\times}32$ grayscale crop before, $\tilde a_{c\ell}$, and after, $\tilde b_{c\ell}$, are normalised and compared; scores are z-scored per camera and summed, $s_\ell=\sum_c (d_{c\ell}-\mu_c)/\sigma_c$ with $d_{c\ell}=\|\tilde a_{c\ell}-\tilde b_{c\ell}\|_1/1024$. Two modes exist. In the \emph{typed} mode the player's left, middle or right fixes the slot, and layers where that slot is already empty are excluded. In the \emph{free} mode no column is given and every slot of every layer competes. Each mode maps the winning z-score and its gap to the runner-up onto a calibrated confidence (typed tiers 92/89/85/82\,\%, free tiers 95/91/88/84\,\%, with $\approx$44--50\,\% for low scores). At 90\,\% or more the block is added to the tower and the player only answers Yes or No; below that nothing is added and the player types the move. Crop extraction runs in parallel worker processes.
+
+\emph{Balance rule.} After a hypothetical pull, for every layer $j$ the centre of mass $\bar c_j$ of the blocks above must lie inside the footprint of the blocks left in $j$ with a 4\,mm margin; the bottom layer and layers at or above the top complete layer are never pullable.
+
+\emph{Collapse.} A fall is declared by two independent checks, each of which must be corroborated by a drop of the 95th-percentile point height of at least 30\,mm: a \emph{height watch} on the fitted box and a \emph{standing check} comparing the point cloud with the box. The false alarms we met each led to a guard: a hand over the lens (guarded by comparing the share of near points with a baseline taken while the tower stood), a collapse of the fitted height after the top blocks were pulled, and a cloud with no points at all. An alarm that no longer holds clears itself on the next readings, so covering the phone and uncovering it removes the banner.
+
+\emph{Placements.} Placements are not observed. Each pulled block goes back on top, as the Jenga rule says; a flag (default on) tells the system to model this, so the tower height follows the effective tower instead of dropping with every pull. With the flag off the pulled block is not replaced. A game that was played with the flag off showed 10 layers for an 8-layer tower before the 3D view honoured it. Placement rules and the one-hand rule cannot fire in this mode.
+
+The sequence of events is in Fig.~\ref{fig:seq}, the data representations in Fig.~\ref{fig:data}.
+\begin{figure}[t]\centering
+\includegraphics[width=\columnwidth]{fig4_data_flow.pdf}
+\caption{Data representations and channels between components.}\label{fig:data}
+\end{figure}
+\begin{figure}[t]\centering
+\includegraphics[width=\columnwidth]{fig5_sequence.pdf}
+\caption{Chronology of one move. Dashed red messages are human or command traffic.}\label{fig:seq}
+\end{figure}
+
+\subsection{Operator interface and replay}
+The Third Eye web app has a Game page (both camera feeds with the overlay and all controls: start and stop, MARK, the Yes/No answer, the typed move, tower settings, re-detect, lock, rotate view, new game) and a 3D tower page that carries the same controls beside a live 3D tower, so a confirmed pull removes its block from the 3D model within about half a second of the answer. A New game button clears the pulled blocks, taps, answers and counters. The server logs every pull and answer in an event log (\code{moves.jsonl}), and a Replay page rebuilds a recorded game from it, move by move, with a 3D scrubber.
+
+\section{Computational Analysis}
+Let $W{\times}H$ be image size, $N$ the points kept from the $256{\times}192$ depth map, $m'$ the capped fit sample ($\le3{,}750$), and $L$ the layer count. JPEG decode and ArUco detection are $\Theta(WH)$ (pixel-wise thresholding and contour extraction). Back-projection is $\Theta(N)$. Each Gauss-Newton iteration evaluates residuals once plus seven times for the numerical Jacobian over $m'$ points; with 30 iterations the fit costs about $240\,m'$ residual evaluations, i.e.\ $\Theta(m')$, independent of image size because of the cap. Face offsets cost $\Theta(LN)$. The balance referee evaluates up to $3L$ candidate pulls, each checking $L$ layers whose above-sets have up to $3L$ blocks, so $\Theta(L^3)$. The measured log-log slope of the referee's time against $L$ (6--36 layers) is 2.80, close to the derived exponent 3 (0.47\,ms at $L=6$, 10.5\,ms at $L=18$). The collapse detector is $O(1)$ per frame. Memory per in-flight frame is 2.1\,MB (960-px decode) or 8.3\,MB (full-resolution decode), plus 1.0\,MB of float64 points for $N\approx41{,}700$. Table~\ref{tab:cx} summarises. Detection of a collapse needs the checks above to see several low frames after the drop; with depth readings at rate $f_h$ the minimum latency is a few $1/f_h$ plus the time to the first low frame (derived, not measured end to end).
+\begin{table}[t]
+\caption{Derived complexity (see the supplement for derivations).}\label{tab:cx}
+\centering\footnotesize
+\begin{tabular}{@{}lll@{}}
+\toprule
+Stage & Time & Space \\
+\midrule
+JPEG, ArUco & $\Theta(WH)$ & $\Theta(WH)$ \\
+Back-projection & $\Theta(N)$ & $\Theta(N)$ \\
+Box fit (capped) & $\Theta(m')$ & $\Theta(m')$ \\
+Face offsets & $\Theta(LN)$ & $\Theta(N)$ \\
+Balance referee & $\Theta(L^3)$ & $\Theta(L)$ \\
+Collapse detector & $O(1)$ & $O(1)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Experimental Setup}\label{sec:setup}
+Acquisition and stage-latency data are three recorded iPhone games from a teammate bundle (\code{game\_01\_far}, \code{game\_02\_moving}, \code{game\_04}: 647, 496, 563 saved frames). The finder was scored on 31 pulls with a known layer from 10 recorded sessions: a layer is known if the player typed a correction, or if the finder was confident and the player did not correct it (taken as right, so this is optimistic). Timings of the stage latencies use \code{perf\_counter} with single-threaded OpenCV on an AMD Ryzen 5 5600H laptop (Python 3.13, OpenCV 5.0), \emph{not} the phone and not the Mac that hosted the real sessions. The replays of the current server (finder, collapse detector, edge-snapping) were run on that Mac over recorded frames and depth, with the server's own functions called in-process; they therefore exclude network and the time the player takes to move their hand. Fig.~\ref{fig:setup} shows the design. Each experiment ran once over its frames; no confidence intervals beyond percentiles are reported.
+\begin{figure}[t]\centering
+\includegraphics[width=\columnwidth]{fig7_experimental_setup.pdf}
+\caption{Experimental setup: recordings, measurement scripts, and result files.}\label{fig:setup}
+\end{figure}
+
+\section{Results and Discussion}\label{sec:measured}
+\subsection{Acquisition (measured)}
+Table~\ref{tab:acq} and Fig.~\ref{fig:intervals} show the saved-frame cadence. The median spacing is 333\,ms in all games, matching $60/20$\,Hz. Effective rates are 3.00, 2.91 and 2.85\,Hz; the shortfall comes from two gaps of 5.2\,s and 3.6\,s, consistent with the app pausing saves when ARKit tracking is not normal (the cause was not logged). No frame group was missing any of its four files. The saved-frame timestamp is the phone's clock at save time, so it proves the save cadence, not the camera's capture cadence. A recording costs 133--153\,MB per minute per iPhone.
+\begin{table}[t]
+\caption{Measured acquisition statistics (real recordings).}\label{tab:acq}
+\centering\footnotesize
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+ & game\_01 & game\_02 & game\_04 \\
+\midrule
+Frames saved & 647 & 496 & 563 \\
+Duration (s) & 215.4 & 169.9 & 197.4 \\
+Rate (Hz) & 3.00 & 2.91 & 2.85 \\
+Median spacing (ms) & 333 & 333 & 333 \\
+p99 spacing (ms) & 350 & 349 & 667 \\
+Gaps $>1$\,s & 0 & 1 (5.2\,s) & 1 (3.6\,s) \\
+Bytes/frame (kB) & 801 & 874 & 780 \\
+\bottomrule
+\end{tabular}
+\end{table}
+\begin{figure}[t]\centering
+\includegraphics[width=0.9\columnwidth]{fig9_interframe_intervals.pdf}
+\caption{Inter-frame intervals of saved frames (log count).}\label{fig:intervals}
+\end{figure}
+\subsection{Stage latency (measured, laptop CPU)}
+Table~\ref{tab:lat} lists stage costs on 80 frames of \code{game\_04}; 62 had at least three detected markers. The rows ``Server decode, 960\,px'', ``ArUco, 960\,px'' and ``Overlay re-encode'' measure the earlier design, in which the server drew and re-encoded the preview; sum of medians 10.1\,ms. With the browser-side overlay the re-encode and the drawing leave the request handler, so this figure is an upper bound for the server's current per-frame cost. We did not re-time it. The depth path (back-projection, fit, offsets) sums to about 67\,ms, of which the fit is 62\,ms; at a 2\,Hz depth rate it occupies about 13\,\% of one core. The fit cost saturates with its sample cap (17\,ms at 250 points to 63\,ms at 2{,}500 and 78\,ms at 10{,}000). Replaying all frames through \code{JengaPipeline} (one camera, no hand detector) took 23.9--27.8\,ms median per frame, 8.5--10.4$\times$ faster than real time at 3\,Hz.
+\begin{table}[t]
+\caption{Per-stage latency on \code{game\_04}, ms (laptop, 1 thread).}\label{tab:lat}
+\centering\footnotesize
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Stage & median & p95 \\
+\midrule
+JPEG decode 1920$\times$1440 & 10.95 & 13.40 \\
+ArUco, 1920 px & 17.69 & 19.73 \\
+Server decode, 960 px & 1.52 & 1.71 \\
+ArUco, 960 px & 7.12 & 8.00 \\
+Overlay re-encode$^\dagger$ & 1.50 & 1.57 \\
+Pose solve & 10.75 & 11.28 \\
+Back-projection & 0.90 & 1.27 \\
+Box fit & 62.24 & 65.22 \\
+Face offsets & 4.08 & 4.70 \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}{\footnotesize $^\dagger$ removed from the server in the current design.}
+\end{table}
+\begin{figure*}[t]\centering
+\includegraphics[width=0.92\textwidth]{fig8_measured.pdf}
+\caption{(a) Stage latency with p95 whiskers; (b) ArUco time and detection rate versus input width over 214 frames; (c) balance-referee cost versus layers (log-log).}\label{fig:meas}
+\end{figure*}
+\subsection{Overlay alignment (measured, small sample)}
+We re-ran the edge-snapping on Android frames from three recorded sessions (16-layer towers) and one later session (8 layers). Five frames had enough markers for a pose. The marker reprojection error was 1.1--1.6\,px. Snapping moved the pose by at most 2.4\,mm in shift and 0.8$^\circ$ in tilt or twist, and raised the edge-alignment score (higher means the projected outline lies on more image edges) from 3.1--5.5 to 6.6--12.5, i.e.\ roughly doubled it, in 0.2--0.3\,s per frame. These are five frames from one setup and the score is our own metric, not a ground-truth position error, so we read the result as ``snapping does something small and consistent'', not as an accuracy figure. A before/after comparison of the overlay against hand-labelled tower corners was not done and is the most useful addition to this section.
+\subsection{Sampling and resolution sweeps}
+Marker detection time grows from 1.8\,ms at 320\,px to 21.1\,ms at 1920\,px, while the fraction of frames with at least three of four markers rises from 48\,\% to 78\,\%; the curve is not monotone between 640 and 960\,px (74\,\% vs 67\,\%), which we attribute to sampling noise of 214 correlated frames and do not interpret. Below 640\,px detection degrades clearly. Decimating \code{game\_04} to a lower frame rate, the collapse was still flagged down to 0.5\,Hz and not flagged at 0.25\,Hz; one recording cannot establish a threshold. These sweeps were run with the earlier collapse rule.
+\subsection{Pull identification}
+Over the 31 pulls with a known layer (10 sessions), the colour-only scorer chose the right layer for 24 (77\,\%) with both cameras combined, and was within one layer for 29 (94\,\%). With the iPhone alone it was right on 23 of 29 (79\,\%); with the Android alone on 16 of 30 (53\,\%), 90\,\% within one layer. Other ways of combining the two cameras gave 71--81\,\%, and the best (81\,\%) was picked after seeing these data, so it is not a held-out figure. Because a confident, uncorrected answer counts as right, these numbers are optimistic. The earlier 78\,\% on 49 pulls and the capture repository's own 82\,\% are not comparable to these 31 and are no longer the headline.
+
+We also replayed recorded sessions through the \emph{current} server, calling its auto-confirm job on every MARK. In an 8-layer game recorded on the calibrated board, all 5 moves were answered at 95\,\% and applied automatically; in a second 8-layer game, 6 of 10 moves were answered at 95\,\% and 4 fell below 90\,\% (best guesses at about 50\,\%) so the player would have typed them; the single move in that game with a known layer was among the unsure ones and its best guess was right. We cannot score the remaining answers from the logs, because no correction means ``assumed right''; the player reported that all predictions in one live game were right, which is an observation, not a measurement. Replaying the older 16-layer sessions, recorded before the board was calibrated and replayed here with the uncorrected pose, performed poorly: no move reached 90\,\%, and the best guess was right for 1 of 7 moves with a known layer. We take this to show that the current finder depends on the calibrated board and cannot be judged on old recordings, not that the old games were harder.
+
+\emph{Time to an answer.} In the replay, the finder's own computation took 0.18--0.19\,s per move in the 5-move session and 0.24--0.34\,s per move in the 10-move session, on a Mac. This excludes the wait for the calm after-window the finder needs (at least 1.6\,s after the player's hand leaves, against 4.5\,s in the earlier version), so the time the player sees is the window plus about 0.3\,s plus the browser's polling (400\,ms). We did not log the player-visible time in the live games, and the earlier version was not re-run, so the speed-up is derived from the settings, not measured as a before/after.
+
+\emph{Depth alone.} For LiDAR depth alone, one camera on \code{game\_04} found 3 of 10 pulls with several corrective options enabled and 0 of 10 without (documented in the repository; not rescored here). A one-camera depth view of a pulled block is a 15--35\,mm dent close to the sensor noise, so depth is used for tower pose, height and collapse, and the pull ledger comes from the player's confirmation and the colour finder.
+
+\emph{Compiled rulebooks (committed files, not re-run).} 15 of 16 corpus entries compiled with a 120B-parameter hosted model, 9 of 16 failed with an 8B local model, and 4 of 80 claims in generated reports were unsupported (5.0\,\%).
+
+\subsection{Collapse detection (measured, three replays)}
+We replayed the depth frames of three recorded sessions (8, 8 and 16 layers) through the server's fit and fall checks, as the live server does. In the one session in which the tower fell, game over was declared 381\,s into the run (194 depth frames), reported as the LiDAR no longer seeing the tower. In the other two sessions (66 and 99 depth frames) no game over was declared. That is one true detection and no false alarm in three games. This is weak evidence: the guards against false alarms were designed on these and similar sessions, and a hand-over-the-lens case was tested by blanking depth in a replay (\code{COVER\_S}), not by a recording of a real hand.
+
+\section{Limitations and Threats to Validity}
+\begin{itemize}
+\item One host per measurement, one run, laptop CPU for stage timings: not those of the phone or of the deployment Mac.
+\item Three games for acquisition, 31 pulls for the finder, three replays for the collapse detector, five frames for edge-snapping; one tower, one desk, one iPhone model. The finder's rules and the collapse guards were tuned on the same sessions, so none of these is a held-out estimate.
+\item Finder labels are optimistic: an uncorrected confident answer is counted as right.
+\item Wired versus Wi-Fi frame rate, end-to-end latency from a pull to the banner, the MediaPipe stage, two-camera depth, and loose-block detection on a real loose block were not measured. Hand over-triggering was retuned (in one game the share of time flagged fell from 39\,\% to 12\,\%), but no systematic before/after was run.
+\item The system is not fully autonomous: below 90\,\% the player types the layer; placements are assumed.
+\item Depth failures are swallowed by the server, and the pose is held for 6\,s without markers; both can hide errors.
+\item Older recordings cannot be re-scored with the current finder because it relies on the calibrated board.
+\item LLM-based results depend on the model; the small local model failed on more than half the corpus.
+\end{itemize}
+
+\section{Conclusion and Future Work}
+We documented the acquisition and processing path of a phone-based Jenga referee and the changes that made it dependable in use: a calibrated board and per-camera edge-snapping for a steady overlay, a confidence-gated finder with player confirmation, and a collapse detector with guards for the cases that fooled it. Saved frames arrive at about 3\,Hz; the finder costs about 0.3\,s of computation per move; a colour-based finder is right on about four in five pulls on our small labelled set. Before submission the most valuable additions are an overlay accuracy comparison against hand-labelled corners before and after calibration, a held-out evaluation of the finder on new games with an independent ground truth (not ``uncorrected means right''), a measured player-visible time from MARK to the answer, a wired-versus-Wi-Fi frame-rate log, and a collapse test on more recorded falls, including a real hand over the lens.
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+\end{document}
