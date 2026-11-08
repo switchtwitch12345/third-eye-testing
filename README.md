@@ -1,170 +1,378 @@
-# Jenga tower tracker (LiDAR + camera) — work in progress
+# Third Eye
 
-An iPhone with LiDAR (and optionally a second, ordinary phone) watches a Jenga tower and shows, on a live
-viewer on your Mac, **green / red on every block**: green = may be pulled, red = may not. It works out which
-layer was pulled after each move, and calls **game over** when pieces fall.
+**A phone-based referee for physical Jenga: it shows which blocks may be pulled, names the block that was pulled, and flags a collapse.**
 
-> **Status: experimental course project.** It works end to end on one tower and one desk setup. The numbers
-> below are from a handful of games, not a proper benchmark.
+![Status: course project](https://img.shields.io/badge/status-course%20project-informational)
+![Platforms: iOS, Android, macOS](https://img.shields.io/badge/platform-iOS%20%7C%20Android%20%7C%20macOS-lightgrey)
+![Python, OpenCV, NumPy](https://img.shields.io/badge/Python-OpenCV%20%7C%20NumPy-3776AB)
 
-![overlay](docs/overlay_example.png)
+<img src="docs/figures/overlay_example.png" alt="Green and red overlay drawn on a real Jenga tower, on a board with ArUco markers" width="420">
 
-## What it does
-| Feature | How | How well (honest numbers) |
+> **Experimental.** It works end to end on one tower and one desk setup, with a player in the loop. Results come from a small number of games and none is held out. See [Evaluation and results](#evaluation-and-results).
+
+**Contents:** [Overview](#overview) · [Key features](#key-features) · [How it works](#how-it-works) · [Architecture](#architecture) · [Tech stack](#technology-stack) · [Repository](#repository-structure) · [Setup](#installation-and-setup) · [Configuration](#configuration) · [Usage](#usage) · [Evaluation](#evaluation-and-results) · [Limitations](#limitations) · [Future work](#future-work) · [Docs](#documentation) · [Contributors](#contributors) · [License](#license-status)
+
+---
+
+## Overview
+
+An iPhone with LiDAR, and optionally a second phone, watches a Jenga tower standing on a printed marker board. A Python server on a Mac places a model of the tower in each camera view and colours every block live. After each move, it compares the tower before and after to find the block that was pulled, and asks the player to confirm or type the answer.
+
+**The problem.** A referee for a physical game needs the state of the pieces and the rules. Jenga layers are only 15 mm tall and look alike, while [published work](https://doi.org/10.1038/s41598-021-01763-9) puts phone LiDAR at about ±1 cm on objects over 10 cm, so the state cannot simply be read from the depth sensor. Third Eye combines a fixed board, before-and-after image comparison, an explicit balance model, and a human confirmation step.
+
+## Key features
+
+| Feature | How it works | Evidence |
 |---|---|---|
-| Red/green per block | Balance rules in `jenga_rules.py`: the weight above a layer must stay over the blocks left in it | Checked by hand-worked cases (`test_jenga_rules.py`) and by playing |
-| Which layer was pulled | After each MARK, type `left` / `middle` / `right`; the CV model compares the tower before/after in that column and finds the layer | 6/7, 8/10, 9/9, 11/12 right on four games; a fresh tall (16-layer) game was 9/9. Confident answers were almost always right; "NOT CONFIDENT" ones need a check |
-| Loose block warning (amber) | LiDAR depth: a block face ≥ 5 mm closer than at the start of the game | Works on replayed recordings with an injected 8 mm / 5 mm push-out. **Not yet seen on a real loose block** |
-| Game over | LiDAR tower-top height: a drop of more than a layer = pieces fell (also: type `fell` in the label box) | Fired on all 3 recorded collapses, silent on the clean game |
-| No moves left | Every remaining block is red | Banner on the viewer and both camera pictures |
-| Tower height from LiDAR | Shown as "LiDAR height ≈ N layers" (matched 16, 9, 7, 9 on four games) | Needs the tower standing and the app streaming depth |
+| **Green / red / amber blocks** | Balance rules in `jenga_rules.py`; amber marks an allowed block that looks loose | Rules: hand-worked unit tests. Amber: only injected offsets, never a real loose block |
+| **Which block was pulled** | `move_infer.py` compares face crops before and after a MARK tap | 25/32 exact layer, offline, with optimistic labels |
+| **Confirm or type** | At 90 % tier or above the block is added and the player answers Yes/No; below that the player types the move | Design choice; tiers are in-sample lookups, not calibrated probabilities |
+| **Collapse detection** | Two LiDAR checks with guards against false alarms | One real fall in three replays; very weak evidence |
+| **Height reading** | LiDAR box fit, height / 15 mm | A simple percentile beat the fit on clean frames |
+| **Replay and 3-D view** | Every change is logged to `moves.jsonl`; the Third Eye UI rebuilds the game | Observed in use |
+| **Wi-Fi or USB cable** | Relays for each phone; falls back to Wi-Fi | Wired frame rates were not measured |
 
-**Not done / known limits**
-* "More than one block removed in one turn" is **not** detected unless the tower's top drops. Normal pulls disturb
-  neighbours too much for a block-count test to tell them apart.
-* Auto-detect of the layer count (Re-detect button) fails on very tall towers: **type the layer count by hand**
-  (the LiDAR height hint helps).
-* Depth only comes from the iPhone, and it sees only some faces from a steep angle (see *Check coverage* in the viewer).
-* ARKit's own mesh was tried and dropped: ~30 mm triangles can't resolve 15 mm layers.
-* The balance model assumes equal block weight and a straight tower; it knows nothing about friction.
+## How it works
 
-## Hardware
-* iPhone with LiDAR (tested on a 15 Pro) running the app in `lidar-capture/` (Xcode, UIKit + ARKit)
-* Optional second camera on the opposite side: any phone (browser page, or your own app that POSTs to `/android`)
-* 4 printed ArUco markers (`aruco_markers_A4.png`: DICT_4X4_50, ids 0-3, **40 mm**), taped in a square ring around the
-  tower footprint (ids run around the square; set the half-spacing with env `MARKER_HALF`, default 80 mm).
-  Phones on stands, ~45 cm away, both seeing at least 3 markers.
-* A Mac on the same Wi-Fi as the phones.
-
-## Quick start
-```bash
-scripts/setup.sh                      # venv + dependencies + fetches STEPWISE into third_party/
-.venv/bin/python tracker/iphone_saved.py      # server: prints your Mac's IP
+```mermaid
+flowchart LR
+    A["Phones stream RGB;<br/>iPhone adds depth"] --> B["ArUco markers,<br/>calibrated board"]
+    B --> C["Tower pose in<br/>each camera"]
+    A --> D["LiDAR points"]
+    D --> E["Box fit and<br/>collapse checks"]
+    C --> F["Overlay shapes,<br/>drawn by browser"]
+    E --> C
+    C --> G["Face crops<br/>while recording"]
+    H["Player taps MARK"] --> I["Choose calm windows<br/>before and after"]
+    G --> I
+    I --> J["Phase correlate,<br/>robust z-scores,<br/>camera mean"]
+    J --> K{"Tier at least 90 %?"}
+    K -- yes --> L["Add block,<br/>ask Yes/No"]
+    K -- no --> M["Player types move"]
+    L --> N["Ledger, balance rules,<br/>new colours"]
+    M --> N
 ```
-1. Open `lidar-capture.xcodeproj` in Xcode, choose **your own signing team**, run on the iPhone, type the Mac's IP.
-   (Rebuild after pulling updates: the app now also streams depth for the loose-block / game-over features.)
-2. Open `http://localhost:8000/` — live view and controls (START / STOP / MARK with the space bar).
-3. Android / second camera (Pixel): install the native app in `android-capture/` (see below), type the
-   computer's IP, and leave it running on its stand. (The old browser page `https://<mac-ip>:8443/cam` still works;
-   accept the certificate warning, the server makes its own certificate in `certs/`.)
-   Calibrate its lens once: `.venv/bin/python tools/calibrate_camera.py --show-board`, then
-   `.venv/bin/python tools/calibrate_camera.py --url http://127.0.0.1:8000/android_raw.jpg`.
-   The shipped `camera_android.json` is **for the author's phone** — replace it with your own calibration.
-4. Optional but recommended once per marker mat: `.venv/bin/python tracker/calibrate_markers.py` measures where your markers
-   really are and writes `marker_map.json` (setup-specific, not in the repo). Without it the nominal layout is used.
 
-## Playing a game
-1. Build a fresh tower. In the viewer's **Tower** panel type the real number of layers (a full tower is 18) and press Apply.
-   For a short tower you can try **Re-detect tower** instead.
-2. Switch on **Training data** (the layer-finder needs the crops it records).
-3. Press **START**. Pull a block. When your hand is out of view, wait ~5 s and press **MARK**.
-4. Type `left`, `middle` or `right` (as seen from the iPhone) in the box and press Enter. The answer appears with a
-   confidence flag; the block is marked removed automatically and the colours update.
-   If it's wrong, type the real layer number to correct it. Corrections are saved in `dataset/<run>/labels.jsonl`.
-5. Colours: **green** may be pulled, **amber** may be pulled but is loose, **red** may not.
-   **NO MOVES LEFT** / **GAME OVER** banners appear on their own.
-6. **New game:** clear the *removed* box in the Tower panel, set the layer count and press Apply (this also clears GAME OVER).
+1. **Pose.** Four 40 mm ArUco markers give the tower's pose. With four markers the server uses IPPE; with three it uses SQPnP plus 24 seeded solves, because three points are ambiguous from a low camera.
+2. **Hand presence.** The game server uses **frame differencing** over the tower region (`MOTION_FRAC`), not a hand-tracking model. Judging pauses while something large moves there.
+3. **Pull finding.** For each face seen before and after a move, the after-image is aligned by phase correlation and the remaining difference becomes a robust z-score. A block's score is the **unweighted mean** of the two cameras' best faces.
+4. **Rules.** After a hypothetical pull, the centre of mass above every layer must stay over that layer's remaining blocks, with a 4 mm margin. Blocks at or above the top complete layer stay put, and a house rule protects the bottom layer.
+5. **Collapse.** A height watch and a standing check each need the highest points to have dropped at least 30 mm. A covered lens counts as "cannot see", not as a fall.
 
-### The rules (`jenga_rules.py`)
-* Only below the highest complete layer (official rule). **House rule of this game: never the bottom layer** — one
-  switch, `BOTTOM_LAYER_LEGAL`, in `jenga_rules.py`.
-* After a pull, the centre of mass of everything above each layer must stay over the blocks left in that layer
-  (4 mm margin). So: with two blocks left (edge + middle) the edge may go but not the middle; with just the middle, or
-  just two edges, nothing may go; a layer is never emptied; a tower already balancing on a thread freezes everything below it.
+<details>
+<summary><b>The balance rule, worked for one layer of a straight tower</b></summary>
 
-## Tests
-```bash
-.venv/bin/python tests/test_jenga_rules.py     # the pull rules, hand-worked cases (no data needed)
-.venv/bin/python tests/test_game_events.py     # synthetic game for the tracker
+| Blocks left in the layer | What may go | Why |
+|---|---|---|
+| Left, middle, right | Any | The remaining two still span the centre |
+| Left, middle (or middle, right) | The edge block only | Middle alone spans the centre; an edge block alone does not |
+| Left, right | Neither | One edge block cannot carry the weight above |
+| Middle | Nothing | It is the last block, and a layer is never emptied |
+
+The model assumes equal block weights and no friction. `BOTTOM_LAYER_LEGAL` in `tracker/jenga_rules.py` switches the house rule.
+</details>
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph Phones
+      IP["iPhone + LiDAR<br/>apps/ios"]
+      AN["Android<br/>apps/android, or /cam page"]
+    end
+    subgraph GS["Game server: tracker/iphone_saved.py, ports 8000 and 8443"]
+      HD["HTTP handler<br/>/preview /depth /upload /android /cmd/*"]
+      PO["Pose and overlay shapes"]
+      DP["Depth path: fit, collapse, loose"]
+      FI["Finder: move_infer"]
+      RU["Balance rules"]
+      ST[("Shared state and pull ledger")]
+    end
+    subgraph TE["Third Eye server: port 8001, upstream repository"]
+      PX["gameproxy: allow-listed /game/*"]
+      GL["gamelink: follows confirmed pulls"]
+      RC["Rule checker, LLM panel"]
+    end
+    UI["Browser: Game, 3-D tower, Replay"]
+    DISK[("iphone_saved/, dataset/<br/>git-ignored")]
+    LLM(["Optional LLM provider"])
+    IP --> HD
+    AN --> HD
+    HD --> PO
+    HD --> DP
+    PO --> FI
+    DP --> RU
+    FI --> ST
+    RU --> ST
+    ST --> DISK
+    ST --> PX
+    ST --> GL
+    GL --> RC
+    PX --> UI
+    UI -. "commands" .-> PX
+    PX -. "commands" .-> HD
+    RC -.-> LLM
 ```
-`tests/test_loose_replay.py` and `tests/test_height_replay.py` replay recorded depth frames and need recordings that are not in this repo.
 
-## Android app (`android-capture/`)
-Kotlin port of the iPhone app for the Pixel, without LiDAR: it streams 1280×720 JPEGs at up to 60 fps over Wi-Fi to
-`POST /android` over plain HTTP (port 8000, no certificate warning; kept-alive sockets, frames encoded and sent four at a time, the
-server answers before running marker detection), shows the markers the server sees, and its
-START / STOP / MARK buttons go through `/cmd/…`, so they drive the iPhone recording just like the viewer buttons.
-The live view shows every frame; disk saves while recording stay at ~3 fps (`ANDROID_SAVE_FPS=10` for more).
-The server works on macOS, Linux or Windows; frames are saved to `iphone_saved/` next to the scripts
-(or `LIDAR_SAVE_DIR`).
-```bash
-cd android-capture && ./gradlew assembleDebug          # needs JDK 17+ and the Android SDK (or open in Android Studio)
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-```
-The lens calibration in `camera_android.json` was made at 1280×720 through Chrome. If markers line up badly, run
-`calibrate_camera.py --url http://127.0.0.1:8000/android_raw.jpg` again while the app is streaming.
+The `tracker/` server has its own viewer at `http://localhost:8000/`. The fuller web UI, rule checker, rule compiler and LLM panel are in [Aadit Pani's Third Eye repository](https://github.com/AaditPani-RVU/ThirdEye), which `scripts/setup.sh` fetches into `third_party/STEPWISE`.
 
-## Layout
+## Technology stack
+
+| Part | Technology |
+|---|---|
+| Game server | Python, standard-library HTTP server, OpenCV (ArUco, PnP, phase correlation), NumPy, Matplotlib |
+| iPhone app | Swift, UIKit, ARKit (scene depth) |
+| Android app | Kotlin, Gradle |
+| Upstream UI and rules | Python, FastAPI, pydantic; React and TypeScript web UI |
+| Calibration | Zhang-style lens calibration, bundle-adjusted marker board |
+| Paper | LaTeX with IEEEtran, TikZ and pgfplots |
+
+## Repository structure
+
+```text
+ThirdEye/
+├── README.md
+├── requirements.txt          Python dependencies for the game server
+├── camera_android.json       Example lens calibration, specific to one phone
+├── apps/
+│   ├── android/              Kotlin capture app (Gradle project)
+│   └── ios/
+│       ├── lidar-capture/              Swift capture app source
+│       └── lidar-capture.xcodeproj/    Xcode project
+├── benchmarks/
+│   ├── benchmark_height.py   Height baselines (needs recordings)
+│   ├── benchmark_pose.py     Pose comparison (needs recordings)
+│   ├── finder_variants/      Finder evaluation scripts, stored per-pull scores, RESULTS.md
+│   └── logs/                 Benchmark output transcribed from a terminal (not original logs)
+├── docs/
+│   ├── analysis/             Quantitative and qualitative analysis notes
+│   ├── figures/              Overlay, crop and orientation images
+│   ├── hardware/             Printable ArUco marker sheet
+│   ├── paper/                Papers (LaTeX, PDF) and two paper figures
+│   └── presentation/         Slides (PDF)
+├── experiments/              Early mesh and unlabelled-data experiments (superseded)
+├── patches/                  Game console changes for the upstream UI
+├── scripts/                  Setup, start-up and wired-mode helpers
+├── tests/                    Rule, fit and replay checks
+├── tools/                    Calibration, crop extraction, label scoring, coverage advice
+└── tracker/                  Game server and every module it imports
 ```
-tracker/       the game server and everything it imports (run: .venv/bin/python tracker/iphone_saved.py)
-tools/         one-off tools: lens / board calibration, crop extraction, scoring, coverage advice
-tests/         unit tests and recorded-game replays
-benchmarks/    height and pose baselines (need recordings that are not in this repo)
-experiments/   early mesh reconstruction and unlabelled-data reports (superseded)
-lidar-capture/ iOS app          android-capture/ Android app
-scripts/       setup, start_all, wired mode      patches/ our changes to Aadit's Third Eye UI
-docs/          paper, presentation, analysis, figures
-```
+
+`tracker/`, `scripts/`, `patches/`, `requirements.txt` and `camera_android.json` are at fixed locations that the code depends on. Keep `tracker/` one level below the root.
+
+<details>
+<summary><b>What each main module does</b></summary>
+
 | File | Purpose |
 |---|---|
-| `tracker/iphone_saved.py` | Upload server + live viewer + overlay + data capture + layer-finder job + loose/game-over watch |
-| `tracker/jenga_rules.py` | Red/green pull rules |
-| `tracker/move_infer.py`, `tools/label_eval.py` | Which layer was pulled (before/after of a MARK) and scoring against `labels.jsonl` |
-| `tracker/tower_points.py` | Marker layout, pose solver (tries many starts when only 3 markers are visible), LiDAR-into-tower-frame |
-| `tracker/tower_fit.py`, `tower_edges.py` | LiDAR box fit of the real tower; per-camera edge snapping |
-| `tracker/tower_auto.py`, `calibrate_markers.py` | Layer count / direction from two cameras; measured marker positions |
-| `tracker/depth_protrusion.py` | LiDAR face offsets: loose blocks and tower height |
-| `tracker/face_crops.py`, `crop_worker.py`, `tools/extract_crops.py` | Face-crop dataset (`dataset/`, not in the repo); crops follow the tower's real height |
-| `tracker/game_events.py`, `live_tracker.py`, `rgb_cue.py`, `stepwise_adapter.py` | Earlier per-slot reader and live tracker |
-| `tools/cluster_crops.py`, `camera_coverage.py` | Unlabelled-data analysis (needs torch for the embedding ones) and best-view advice |
-| `tools/calibrate_camera.py`, `calibrate_board.py`, `android_cam.py` | Lens calibration, one-time board calibration, app-free capture |
-| `docs/paper/`, `docs/analysis/` | Course paper (PDF + LaTeX), presentation, qualitative / quantitative analysis |
+| `tracker/iphone_saved.py` | Server, viewer, overlay, hand gate, data capture, finder jobs, collapse and loose-block watch |
+| `tracker/jenga_rules.py` | Green/red rules and the effective tower after placements |
+| `tracker/move_infer.py` | Deployed finder and confidence tiers |
+| `tracker/tower_points.py` | Marker layout, pose solver, frame correction |
+| `tracker/tower_fit.py`, `tracker/tower_edges.py` | LiDAR box fit; edge snapping per camera |
+| `tracker/tower_auto.py`, `tracker/calibrate_markers.py` | Layer count from two cameras; per-game marker measurement |
+| `tracker/depth_protrusion.py` | LiDAR points and face offsets |
+| `tracker/face_crops.py`, `tracker/crop_worker.py` | Face-crop dataset |
+| `tracker/game_events.py`, `tracker/live_tracker.py`, `tracker/rgb_cue.py`, `tracker/stepwise_adapter.py` | Earlier per-slot reader and tracker; need `third_party/`; not in the deployed path |
+| `tools/calibrate_camera.py`, `tools/calibrate_board.py` | Lens calibration; one-time marker-board calibration |
+| `tools/label_eval.py`, `tools/extract_crops.py`, `tools/cluster_crops.py`, `tools/camera_coverage.py`, `tools/android_cam.py` | Label scoring, crop extraction, clustering, view advice, app-free capture |
+</details>
 
-Runtime data stays at the repo root and is git-ignored: `iphone_saved/` (frames), `dataset/`, `marker_map.json`, `certs/`.
+## Installation and setup
 
-## Third Eye UI (Aadit's repo + our game console)
+> **Verification status.** The full setup needs a Mac and two phones, so these commands were checked against the code but not run end to end during this documentation pass. On Windows, the server started and served its pages from this layout, and it needed `PYTHONIOENCODING=utf-8` and OpenSSL available. The Xcode and Gradle projects were moved as whole folders and have not been rebuilt since.
 
-`third_party/STEPWISE` is Aadit Pani's Third Eye repo (branch `jenga-real-data-eval`): rule checker, 3D tower,
-"Ask the referee" LLM panel, and a follow bridge that judges the pulls our server confirms. Our **Game** tab sits in
-his UI and has every control of our own viewer (cameras with the red/green/amber overlay, START/MARK/STOP,
-left/middle/right box, Re-detect, tower settings, data capture, coverage, NO MOVES LEFT / GAME OVER).
+**You need:**
+
+- A Mac on the same network as the phones (the helper scripts assume macOS paths and tools).
+- An iPhone with LiDAR. A 15 Pro was tested.
+- Optionally, an Android phone, on a stand on the opposite side.
+- The four markers from [`docs/hardware/aruco_markers_A4.png`](docs/hardware/aruco_markers_A4.png): `DICT_4X4_50`, ids 0–3, 40 mm, in a ring around the tower. Each phone should see at least three, from about 45 cm.
+
+**1. Server**
 
 ```bash
-scripts/setup.sh        # once: clones his repo, applies patches/thirdeye-game-console.patch, builds his env + UI
-scripts/start_all.sh    # game server on :8000 (phones connect here) + Third Eye UI on http://localhost:8001/#/game
+scripts/setup.sh                          # venv, dependencies, fetches upstream into third_party/
+.venv/bin/python tracker/iphone_saved.py  # prints this Mac's IP; viewer on http://localhost:8000/
 ```
-The Game tab talks to our server through his server's `/game/...` proxy (`thirdeye/server/gameproxy.py`: a fixed
-allow-list of paths, one fixed address). Press **Judge this game with Third Eye rules** to open his Live tab on the
-same game. His LLM features need a key in `third_party/STEPWISE/.env` (e.g. `GROQ_API_KEY=...`).
 
-**The overlay fits the real tower.** `tracker/tower_fit.py` lines a 75 x 75 mm model of the tower (and the board under it) up with
-the iPhone's LiDAR points every half second and folds the result into the pose that every overlay, face crop and depth
-check uses (`tower_points.set_correction`): the tower's real position, tilt and twist, and its height. It settles in about
-3 seconds after the app starts streaming depth; **Re-detect** refits from scratch and sets the layer count from the height
-(height / 15 mm, checked on five recorded towers). Tests: `test_tower_fit.py`, `test_height_replay.py`.
+**2. iPhone app.** Open `apps/ios/lidar-capture.xcodeproj` in Xcode, choose your own signing team, run it on the phone, and type the Mac's IP.
 
-## Wired mode (USB cable instead of Wi-Fi)
+**3. Android app (optional).** Needs JDK 17+ and the Android SDK.
 
-Optional. The phones work over Wi-Fi exactly as before; with a cable the picture is smoother (about 15-30 fps instead of about 10).
+```bash
+cd apps/android && ./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
 
-* **iPhone.** A cable lets the Mac reach the phone but not the other way round, so the app (`lidar-capture/UsbRelay.swift`)
-  queues its requests on port 8765 and `scripts/usb_bridge.py` (through `iproxy`) collects them, plays them to the game
-  server and hands the answers back. The app notices the bridge by itself (the IP box turns green) and falls back to
-  Wi-Fi a few seconds after the bridge stops. On the cable it sends every 2nd frame, 8 at once; on Wi-Fi every 6th, 1 at a time.
-  Needs `brew install libimobiledevice`; run `.venv/bin/python scripts/usb_bridge.py` next to the game server.
-* **Android.** Nothing to relay: `adb reverse tcp:8000 tcp:8000` (what `scripts/wired.sh` does) makes the Mac's game
-  server appear as `localhost:8000` on the phone, so the browser page `http://localhost:8000/cam` (or a native app that
-  POSTs JPEG frames to `/android`) works with no network. Needs `brew install android-platform-tools` and USB debugging.
-  The native app (`android-capture/`) checks `127.0.0.1:8000` once a second; while the game server answers there it sends
-  everything over the cable, the IP box turns green and the status says `🔌 USB`. Unplug (or no `adb reverse`) and it is
-  back on the typed Wi-Fi IP within 3 s. Re-run `scripts/wired.sh` after replugging: `adb reverse` does not survive it.
-  `scripts/wired_auto.sh` does both phones hands-off: it re-applies `adb reverse` whenever the Android phone is plugged in
-  and runs the iPhone bridge, so you just plug in and play (Wi-Fi is used for any phone without a cable).
+The browser page `https://<mac-ip>:8443/cam` also works, after accepting the self-signed certificate warning.
 
-## Notes
-* Recordings and the dataset are deliberately not in this repo (large; they show people). `docs/` has tower-only figures.
-* Tower orientation matters: the marker frame is turned so the bottom layer runs along x
-  (`tower_points.py`, `LAYOUTS["A"]`). A different build orientation needs that one table changed.
-* `experiments/tap_report.py` (ResNet18 / DINOv2 fingerprints) needs `torch`, `torchvision`, `transformers`; the rest does not.
-* Depth reader and tower geometry come from **STEPWISE / ThirdEye** by Aadit Pani
-  (https://github.com/AaditPani-RVU/STEPWISE), fetched by the setup script, not copied here.
+**4. Calibration.** The shipped `camera_android.json` is for one specific phone, so replace it with your own:
+
+```bash
+.venv/bin/python tools/calibrate_camera.py --show-board
+.venv/bin/python tools/calibrate_camera.py --url http://127.0.0.1:8000/android_raw.jpg
+.venv/bin/python tools/calibrate_board.py       # once, for a permanently fixed board; writes marker_map.json
+```
+
+For a board that isn't fixed, use `.venv/bin/python tracker/calibrate_markers.py` instead. Without a `marker_map.json` the nominal layout is used.
+
+**5. Third Eye UI (optional).**
+
+```bash
+scripts/start_all.sh   # game server on :8000, UI on http://localhost:8001/#/game
+```
+
+> **Known setup issue.** `scripts/setup.sh` checks out upstream branch `jenga-real-data-eval`, but `patches/thirdeye-game-console.patch` does not apply to it at the current upstream commit, and the script's `|| true` hides the failure. A fresh install may therefore have no Game tab. The Game tab code exists on upstream branch `mitul/game-console`, which is a possible workaround that hasn't been tested here.
+
+## Configuration
+
+Environment variables read by the server and modules:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LIDAR_PORT` | `8000` | HTTP port |
+| `LIDAR_HTTPS_PORT` | `8443` | HTTPS port for the browser camera page |
+| `LIDAR_SAVE_DIR` | `iphone_saved/` | Where frames are saved |
+| `MARKER_HALF` | `80` | Half the marker spacing, in mm, when there is no marker map |
+| `MARKER_MAP` | on | `off` ignores `marker_map.json` |
+| `POSE_EMA` | `0.2` | Share of each new pose taken while a phone is still |
+| `ANALYSIS_FPS` | `10` | Most overlay updates per second, per phone |
+| `ANDROID_SAVE_FPS` | `3` | Android frames saved per second while recording |
+
+Upstream LLM features read a key from `third_party/STEPWISE/.env`, for example `GROQ_API_KEY=...`.
+
+## Usage
+
+**Playing a game**
+
+1. Build the tower. In the **Tower** panel, type the number of layers and press Apply. **Re-detect** can measure it, but may fail on very tall towers.
+2. Switch on **Training data**: the finder needs the crops it records.
+3. Press **START**, then pull a block.
+4. When your hand is clear, press **MARK**. The system waits for a calm view.
+5. If it is sure enough (at least 90 %), it adds the block and asks **Yes/No**. Otherwise, type the column and layer, for example `l 5`.
+6. Colours update: **green** may be pulled, **amber** may be pulled but looks loose, **red** may not. **NO MOVES LEFT** and **GAME OVER** banners appear on their own.
+7. For a new game, use the **New game** control, or clear the *removed* box and press Apply.
+
+Typing `fell` in the label box also declares a collapse.
+
+**Example workflow**
+
+```text
+Tower panel: layers = 8, Apply      → all 8 layers drawn, colours shown
+Training data: on, START            → frames and crops being recorded
+Pull a block, then MARK             → "layer 5, left column - 95% sure. Added to the tower."
+Yes                                 → logged as confirmed; 3-D view updated
+Next pull, MARK                     → "Best guess layer 3 - only 50% sure, so nothing was changed."
+Type: r 3                           → block marked removed; colours update
+```
+
+The messages above are illustrative of the wording used in `tracker/iphone_saved.py`.
+
+<details>
+<summary><b>Wired mode (USB instead of Wi-Fi)</b></summary>
+
+- **iPhone.** The app queues requests on port 8765 and `scripts/usb_bridge.py` collects them through `iproxy`. Install with `brew install libimobiledevice`, then run `.venv/bin/python scripts/usb_bridge.py`.
+- **Android.** `scripts/wired.sh` runs `adb reverse tcp:8000 tcp:8000`, and the app switches by itself. Re-run it after replugging.
+- **Both.** `scripts/wired_auto.sh` handles both phones hands-off.
+
+The apps return to Wi-Fi if the cable goes away. Wired frame rates were not measured.
+</details>
+
+**Tests**
+
+```bash
+.venv/bin/python tests/test_jenga_rules.py   # no data needed
+.venv/bin/python tests/test_tower_fit.py     # no data needed
+```
+
+| Test | Needs |
+|---|---|
+| `tests/test_game_events.py` | `third_party/STEPWISE` from setup |
+| `tests/test_height_replay.py`, `tests/test_loose_replay.py` | Private recordings, and run arguments |
+
+These are scripts rather than pytest tests, so `pytest tests` reports collection errors.
+
+## Evaluation and results
+
+These figures come from a small, single-setup case study. **None is held out**, and constants were tuned on the same sessions. Full methods are in the [paper source](docs/paper/third_eye_paper_v2.tex).
+
+| Question | Result | How to read it |
+|---|---|---|
+| **Finder, offline** | **25/32 exact layer** (78 %, Wilson 95 % 61–89 %); 30/32 within one, 11 games | Offline evaluation of the deployed scoring, not live end-to-end accuracy. A confident answer nobody corrected counts as correct, so this is optimistic |
+| Finder, earlier snapshot | 24/31 exact (77 %), 10 games | The same data without one game. No experimental reason for its absence is recorded |
+| Product rule | 26/32 | Exists only in an offline script, chosen after seeing the data. Not deployed and not validated |
+| **Cameras** | Inconclusive | On these sets iPhone leads (24/30 vs 17/31). An older 57-pull set had Android ahead, 59 % to 49 %, for unknown reasons |
+| **Overlay** | LiDAR fit did not beat markers alone: 2.95 vs 3.07, 75 frames | An edge-strength proxy, not a position error. Snapping scores higher, but it optimises that same score |
+| **Height** | 98th percentile 98 % exact vs box fit 88 %, 233 frames from 3 towers | Hand-free frames. In a synthetic hand test the box fits had lower error than the percentile |
+| **Collapse, current detector** | One real fall detected; no false alarm in two other games | One event. Guards were designed on similar sessions, and the lens case was only simulated |
+| **Tall towers** | Not established | Three results under different conditions: 10/13 in the offline set; 1/7 replaying pre-calibration recordings; 9/9 in one game on 25 October with an older finder. They are not combined |
+
+Older figures in earlier versions of this README (3/3 collapses, 25 October, older height-only detector; and the 9/9 tall-tower game) were different experiments and don't describe the current system.
+
+**Data provenance.** `benchmarks/finder_variants/variant_scores.json` is stored script output. `benchmarks/logs/*.txt` are **transcribed** from a terminal, not original logs. Stage timings, including the 62 ms box fit, came from another machine with no log, so they aren't headline results. Recordings (`dataset/`, `iphone_saved/`) show identifiable people and rooms and are deliberately not published, so the benchmarks can't be re-run from this repository alone.
+
+> **Warning.** Running `benchmarks/finder_variants/eval_variants.py` without the private `dataset/` folder overwrites `variant_scores.json` with empty results. If that happens, restore the file with `git restore benchmarks/finder_variants/variant_scores.json`.
+
+## Limitations
+
+**System**
+
+- Needs a printed board, phones on stands and a recording running; the helper scripts assume a Mac.
+- Placements are assumed, not observed. More than one block removed in a turn goes undetected unless the top drops.
+- The balance model assumes a straight tower, equal block weights and no friction.
+- Depth comes from the iPhone only, and it sees only some faces from a steep angle.
+- Frame differencing detects motion, not hands, and any large change near the tower counts.
+- Depth exceptions are caught and lost silently, and poses are held for up to 6 s without markers.
+- The loose-block warning has never been tested on a real loose block.
+
+**Evaluation**
+
+- Few games, one tower, one board, one lighting setup, the authors as players.
+- Labels are optimistic, and pulls within a game are correlated.
+- End-to-end latency, millimetre overlay error and wired frame rates were not measured.
+
+**Known code issues**
+
+- `benchmarks/benchmark_height.py` fails with a missing `time` import.
+- See the setup note about the Game tab patch.
+
+## Future work
+
+- A held-out test with frozen settings and independent ground truth, such as video review of each pull.
+- Overlay error in millimetres against hand-clicked tower corners.
+- Counts of each label type, and a resolution of the 57-pull camera disagreement.
+- Logged MARK-to-answer time and wired-versus-Wi-Fi frame rates.
+- More recorded falls, a real hand over the lens, and a real loose block.
+- A measurement of how the Yes/No prompt affects players.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [`docs/paper/third_eye_paper_v2.tex`](docs/paper/third_eye_paper_v2.tex) | Main paper: design, methods, results, threats to validity |
+| [`docs/paper/CS3235_paper.tex`](docs/paper/CS3235_paper.tex), [`CS3235_TeamNo_ThirdEye.pdf`](docs/paper/CS3235_TeamNo_ThirdEye.pdf) | Earlier course paper |
+| [`docs/presentation/Third_Eye_Presentation.pdf`](docs/presentation/Third_Eye_Presentation.pdf) | Slides |
+| [`docs/analysis/quantitative_analysis.md`](docs/analysis/quantitative_analysis.md) | Numbers and intervals |
+| [`docs/analysis/qualitative_analysis.md`](docs/analysis/qualitative_analysis.md) | Failure modes and interpretation |
+| [`benchmarks/finder_variants/RESULTS.md`](benchmarks/finder_variants/RESULTS.md) | Finder comparison across label sets |
+
+<img src="docs/paper/fig_replay.png" alt="Replay page showing a 3-D tower, a move list with confidence, and before and after crops" width="620">
+
+*Replay of a recorded 8-layer game in the Third Eye UI.*
+
+## Contributors
+
+| | Profile |
+|---|---|
+| **Aadit Pani** | [github.com/AaditPani-RVU](https://github.com/AaditPani-RVU/) |
+| **Megh Mavani** | [github.com/meghmavani](https://github.com/meghmavani) |
+| **Mitul K M** | [github.com/switchtwitch12345](https://github.com/switchtwitch12345/) |
+
+## Acknowledgements
+
+The depth reader, tower geometry, rule checker and upstream web UI come from [Aadit Pani's Third Eye repository](https://github.com/AaditPani-RVU/ThirdEye), fetched at setup rather than copied here. This work was carried out at RV University, Bengaluru.
+
+## License status
+
+This repository has **no license file**, so no open-source license has been granted. Contact the contributors before reusing the code.
