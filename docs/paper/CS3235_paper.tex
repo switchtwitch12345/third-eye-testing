@@ -109,7 +109,7 @@ The web app has three screens. \textbf{Game} shows both camera feeds with the gr
 \begin{figure}[t]
 \centering\singlespacing
 \includegraphics[height=4.6cm]{fig_overlay.png}\hspace{1cm}\includegraphics[height=4.6cm]{fig_replay.png}
-\caption{(a) Overlay on the iPhone view; layers are counted from the bottom. (b) Replay of a recorded 8-layer game: the 3D tower after nine pulls, the move list with confidence, and the before/after crops.}\label{fig:ui}
+\caption{(a) Overlay on the iPhone view; layers are counted from the bottom. (b) Replay of a recorded 8-layer game: the 3D tower after nine pulls, and the move list with confidence.}\label{fig:ui}
 \end{figure}
 \subsection{Deployment details}
 Third Eye is a local demo, not a hosted service: two Python servers run on a Mac (game server on port 8000, Third Eye on 8001, started by \code{scripts/start\_all.sh}) and the browser runs on the same Mac. Phones connect over Wi-Fi or a USB cable (the iPhone queues requests that a bridge on the Mac collects; the Android uses \code{adb reverse}). \tbd{Public URL: none; local demo only}.
