@@ -10,7 +10,7 @@
 
 > **Experimental.** It works end to end on one tower and one desk setup, with a player in the loop. Results come from a small number of games and none is held out. See [Evaluation and results](#evaluation-and-results).
 
-**Contents:** [Overview](#overview) · [Key features](#key-features) · [How it works](#how-it-works) · [Architecture](#architecture) · [Tech stack](#technology-stack) · [Repository](#repository-structure) · [Setup](#installation-and-setup) · [Configuration](#configuration) · [Usage](#usage) · [Evaluation](#evaluation-and-results) · [Limitations](#limitations) · [Future work](#future-work) · [Docs](#documentation) · [Contributors](#contributors) · [License](#license-status)
+**Contents:** [Overview](#overview) · [Key features](#key-features) · [How it works](#how-it-works) · [Architecture](#architecture) · [Tech stack](#technology-stack) · [Repository](#repository-structure) · [Setup](#installation-and-setup) · [Configuration](#configuration) · [Usage](#usage) · [Evaluation](#evaluation-and-results) · [Limitations](#limitations) · [Future work](#future-work) · [Docs](#documentation) · [License](#license-status)
 
 ---
 
@@ -357,22 +357,10 @@ Older figures in earlier versions of this README (3/3 collapses, 25 October, old
 | [`docs/analysis/qualitative_analysis.md`](docs/analysis/qualitative_analysis.md) | Failure modes and interpretation |
 | [`benchmarks/finder_variants/RESULTS.md`](benchmarks/finder_variants/RESULTS.md) | Finder comparison across label sets |
 
-<img src="docs/paper/fig_replay.png" alt="Replay page showing a 3-D tower, a move list with confidence, and before and after crops" width="620">
+<img src="docs/paper/fig_replay.png" alt="Replay page showing a 3-D tower, and a move list with confidence" width="620">
 
 *Replay of a recorded 8-layer game in the Third Eye UI.*
 
-## Contributors
-
-| | Profile |
-|---|---|
-| **Aadit Pani** | [github.com/AaditPani-RVU](https://github.com/AaditPani-RVU/) |
-| **Megh Mavani** | [github.com/meghmavani](https://github.com/meghmavani) |
-| **Mitul K M** | [github.com/switchtwitch12345](https://github.com/switchtwitch12345/) |
-
-## Acknowledgements
-
-The depth reader, tower geometry, rule checker and upstream web UI come from [Aadit Pani's Third Eye repository](https://github.com/AaditPani-RVU/ThirdEye), fetched at setup rather than copied here. This work was carried out at RV University, Bengaluru.
-
 ## License status
 
-This repository has **no license file**, so no open-source license has been granted. Contact the contributors before reusing the code.
+This repository has **no license file**, so no open-source license has been granted. Contact the authors before reusing the code.
